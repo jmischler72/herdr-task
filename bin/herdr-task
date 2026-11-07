@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import argparse
 import fcntl
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,16 @@ from urllib.parse import urlparse
 import uuid
 
 
+VALID_TASK_STATUSES = ("todo", "in_progress", "in_review", "done", "archived")
+
+TASK_STATUS_ICONS: dict[str, str] = {
+    "todo": "📋",
+    "in_progress": "🚧",
+    "in_review": "👀",
+    "done": "✅",
+    "archived": "📦",
+}
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "repo_roots": [
         os.path.expanduser("~/Projects"),
@@ -41,6 +52,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cockpit_editor": "nvim .",
     "cockpit_git": "lazygit",
     "cockpit_agent": "copilot",
+    "automations": {
+        "jira_status_sync": {
+            "enabled": True,
+        },
+    },
     "pilot_models": [
         {
             "id": "copilot-luna",
@@ -142,12 +158,26 @@ class TaskPaths:
         raw = base_dir or os.environ.get("HERDR_TASKS_DIR") or "~/.config/herdr/tasks"
         self.base = Path(os.path.expanduser(str(raw))).resolve()
         self.archive = self.base / "archive"
+        self.user_automations = self.base / "automations"
         self.lock_file = self.base / ".lock"
         self.config_file = self.base / "config.json"
 
     def ensure_dirs(self) -> None:
         self.base.mkdir(parents=True, exist_ok=True)
         self.archive.mkdir(parents=True, exist_ok=True)
+
+    def automation_search_dirs(self) -> list[Path]:
+        dirs: list[Path] = []
+        script_rel = Path(__file__).resolve().parent.parent / "automations"
+        builtin_plugin = Path(os.path.expanduser("~/.config/herdr/tasks/plugin/automations"))
+        for cand in (script_rel, builtin_plugin, self.base / "plugin" / "automations", self.user_automations):
+            try:
+                resolved = cand.resolve()
+                if resolved.is_dir() and resolved not in dirs:
+                    dirs.append(resolved)
+            except Exception:
+                continue
+        return dirs
 
     def _safe_json_path(self, directory: Path, task_id: str) -> Path:
         tid = task_id.strip()
@@ -168,18 +198,123 @@ class TaskPaths:
 
 def load_config(paths: TaskPaths) -> dict[str, Any]:
     paths.ensure_dirs()
-    cfg = dict(DEFAULT_CONFIG)
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     if paths.config_file.exists():
         try:
             user_cfg = json.loads(paths.config_file.read_text(encoding="utf-8"))
             if isinstance(user_cfg, dict):
-                cfg.update(user_cfg)
+                user_autos = user_cfg.get("automations")
+                for k, v in user_cfg.items():
+                    if k != "automations":
+                        cfg[k] = v
+                if isinstance(user_autos, dict):
+                    cfg_autos = cfg.setdefault("automations", {})
+                    for auto_id, auto_conf in user_autos.items():
+                        if isinstance(auto_conf, dict):
+                            cfg_autos.setdefault(auto_id, {}).update(auto_conf)
+                        else:
+                            cfg_autos[auto_id] = auto_conf
         except Exception:
             pass
     env_wt = os.environ.get("HERDR_WORKTREES_DIR", "").strip()
     if env_wt:
         cfg["worktrees_root"] = env_wt
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# Modular Lifecycle Automation Engine
+# ---------------------------------------------------------------------------
+
+def discover_automations(paths: TaskPaths, cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    discovered_by_id: dict[str, dict[str, Any]] = {}
+    user_auto_cfg = cfg.get("automations") if isinstance(cfg.get("automations"), dict) else {}
+
+    for folder in paths.automation_search_dirs():
+        for py_file in sorted(folder.glob("*.py")):
+            if py_file.name.startswith("_"):
+                continue
+            mod_name = f"herdr_task_auto_{py_file.stem}"
+            try:
+                spec = importlib.util.spec_from_file_location(mod_name, str(py_file))
+                if not spec or not spec.loader:
+                    continue
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+            except Exception:
+                continue
+
+            handle_fn = getattr(mod, "handle_event", None)
+            if not callable(handle_fn):
+                continue
+
+            auto_id = str(getattr(mod, "AUTOMATION_ID", py_file.stem)).strip()
+            description = str(getattr(mod, "DESCRIPTION", "")).strip()
+            events = tuple(getattr(mod, "EVENTS", ()))
+            default_settings = getattr(mod, "DEFAULT_SETTINGS", {})
+            settings: dict[str, Any] = (
+                json.loads(json.dumps(default_settings)) if isinstance(default_settings, dict) else {}
+            )
+
+            ovr = user_auto_cfg.get(auto_id)
+            if isinstance(ovr, bool):
+                settings["enabled"] = ovr
+            elif isinstance(ovr, dict):
+                for sk, sv in ovr.items():
+                    if sk == "status_map" and isinstance(sv, dict) and isinstance(settings.get("status_map"), dict):
+                        settings["status_map"].update(sv)
+                    else:
+                        settings[sk] = sv
+
+            discovered_by_id[auto_id] = {
+                "id": auto_id,
+                "description": description,
+                "events": list(events),
+                "enabled": bool(settings.get("enabled", True)),
+                "path": str(py_file),
+                "settings": settings,
+                "module": mod,
+            }
+
+    return list(discovered_by_id.values())
+
+
+def dispatch_automation_event(
+    event: str,
+    task: dict[str, Any],
+    paths: TaskPaths,
+    cfg: dict[str, Any],
+    **extra_context: Any,
+) -> tuple[bool, list[str]]:
+    automations = discover_automations(paths, cfg)
+    any_modified = False
+    messages: list[str] = []
+
+    context: dict[str, Any] = {
+        "event": event,
+        "task": task,
+        "paths": paths,
+        "config": cfg,
+        **extra_context,
+    }
+
+    for auto in automations:
+        if not auto["enabled"]:
+            continue
+        if auto["events"] and event not in auto["events"]:
+            continue
+        try:
+            res = auto["module"].handle_event(event, context, auto["settings"])
+            if isinstance(res, dict):
+                if res.get("task_modified"):
+                    any_modified = True
+                for m in res.get("messages") or []:
+                    if m:
+                        messages.append(f"[{auto['id']}] {m}")
+        except Exception as e:
+            messages.append(f"[{auto['id']}] Error handling {event}: {e}")
+
+    return any_modified, messages
 
 
 @contextmanager
@@ -1082,6 +1217,13 @@ def cmd_create(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) 
     title = spec.get("title") or getattr(args, "title", None) or "Untitled Task"
     raw_id = spec.get("id") or getattr(args, "id", None)
     brief = spec.get("brief") or getattr(args, "brief", None)
+    initial_task_status = (
+        spec.get("status")
+        or getattr(args, "task_status", None)
+        or "in_progress"
+    )
+    if initial_task_status not in VALID_TASK_STATUSES:
+        initial_task_status = "in_progress"
 
     raw_resources: list[Any] = list(spec.get("resources") or [])
     for link_val in getattr(args, "link", None) or []:
@@ -1161,7 +1303,7 @@ def cmd_create(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) 
             "id": task_id,
             "title": title,
             "brief": brief,
-            "status": "in_progress",
+            "status": initial_task_status,
             "created_at": now,
             "updated_at": now,
             "workspace_id": None,
@@ -1174,6 +1316,8 @@ def cmd_create(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) 
             upsert_resource(task, res_obj)
         # Reserve the task ID atomically before provisioning worktrees/workspaces
         atomic_write_json(paths.task_file(task_id), task)
+
+    _, auto_msgs = dispatch_automation_event("task.created", task, paths, cfg)
 
     repos: list[str] = []
     if "repos" in spec and isinstance(spec["repos"], list):
@@ -1254,6 +1398,8 @@ def cmd_create(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) 
         print(json.dumps(task, indent=2))
     else:
         print(f"Created task '{task_id}' (workspace: {task.get('workspace_id') or 'none'}, repos: {len(worktrees)}, resources: {len(task['resources'])})")
+        for m in auto_msgs:
+            print(f"  ↳ {m}")
     return 0
 
 
@@ -1284,7 +1430,6 @@ def cmd_link(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) ->
             k, v = kv.split("=", 1)
             meta_dict[k.strip()] = v.strip()
 
-    # Check if this PR resource already exists with branch metadata so partial updates skip slow network calls
     existing_task = load_task(paths, tid)
     if not existing_task:
         print(f"Error: task '{tid}' not found.", file=sys.stderr)
@@ -1317,20 +1462,33 @@ def cmd_link(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) ->
 
     branch_switch_msg: str | None = None
     title_updated = False
+    auto_msgs: list[str] = []
     with task_store_lock(paths):
         task = load_task(paths, tid)
         if not task:
             print(f"Error: task '{tid}' not found.", file=sys.stderr)
             return 1
+        old_title = task.get("title")
         saved = upsert_resource(task, res_obj)
+
+        _, auto_msgs = dispatch_automation_event(
+            "resource.linked",
+            task,
+            paths,
+            cfg,
+            resource=saved,
+        )
 
         meta = saved.get("metadata") or {}
         jk = meta.get("jira_key")
         if jk and not any(r.get("category") == "ticket" and r.get("ref") == jk for r in task.get("resources", [])):
-            upsert_resource(task, classify_resource(jk, cfg, added_by="pilot"))
+            jk_res = upsert_resource(task, classify_resource(jk, cfg, added_by="pilot"))
+            _, jk_msgs = dispatch_automation_event("resource.linked", task, paths, cfg, resource=jk_res)
+            auto_msgs.extend(jk_msgs)
 
         if task.get("title") in (None, "", "Untitled Task") and meta.get("pr_title"):
             task["title"] = meta["pr_title"]
+        if task.get("title") != old_title:
             title_updated = True
 
         pr_repo = meta.get("repo")
@@ -1363,6 +1521,8 @@ def cmd_link(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) ->
         print(f"Linked [{saved['category']}] {saved['ref']} -> task '{tid}'")
         if branch_switch_msg:
             print(f"  ↳ {branch_switch_msg}")
+        for m in auto_msgs:
+            print(f"  ↳ {m}")
     return 0
 
 
@@ -1426,12 +1586,24 @@ def cmd_note(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) ->
 def format_task_status_text(task: dict[str, Any], color: bool = False) -> str:
     c_bold = "\033[1m" if color else ""
     c_cyan = "\033[36m" if color else ""
+    c_green = "\033[32m" if color else ""
     c_yellow = "\033[33m" if color else ""
+    c_magenta = "\033[35m" if color else ""
     c_dim = "\033[2m" if color else ""
     c_reset = "\033[0m" if color else ""
 
+    raw_st = (task.get("status") or "in_progress").lower()
+    st_icon = TASK_STATUS_ICONS.get(raw_st, "🚧")
+    st_color = (
+        c_green if raw_st == "done"
+        else c_magenta if raw_st == "in_review"
+        else c_yellow if raw_st == "todo"
+        else c_dim if raw_st == "archived"
+        else c_cyan
+    )
+
     lines = [
-        f"{c_bold}{c_cyan}[{task.get('status', 'in_progress').upper()}] {task['id']}: {task.get('title', '')}{c_reset}  {c_dim}(ws: {task.get('workspace_id') or 'closed'}){c_reset}",
+        f"{c_bold}{st_color}{st_icon} [{raw_st.upper()}] {task['id']}: {task.get('title', '')}{c_reset}  {c_dim}(ws: {task.get('workspace_id') or 'closed'}){c_reset}",
     ]
     if task.get("brief"):
         lines.append(f"{c_bold}Brief:{c_reset} {task['brief']}")
@@ -1510,13 +1682,15 @@ def format_fzf_task_line(t: dict[str, Any]) -> str:
         r["ref"] for r in t.get("resources", []) if r.get("category") == "ticket"
     ) or "-"
     ws = t.get("workspace_id") or "-"
+    st = (t.get("status") or "in_progress").lower()
+    st_icon = TASK_STATUS_ICONS.get(st, "🚧")
     branches = " ".join(w.get("branch", "") for w in t.get("worktrees", []))
     res_tokens = " ".join(
         f"{r.get('ref', '')} {r.get('label', '')} {r.get('provider', '')} {r.get('status', '')}"
         for r in t.get("resources", [])
     )
-    search_blob = f"{branches} {res_tokens}".replace("\t", " ").replace("\n", " ")
-    return f"{t['id']}\t[{ws}] {t.get('title', '')}  (repos: {repos} | tickets: {tickets})\t{search_blob}"
+    search_blob = f"{st} {branches} {res_tokens}".replace("\t", " ").replace("\n", " ")
+    return f"{t['id']}\t{st_icon} [{st.upper()}] [{ws}] {t.get('title', '')}  (repos: {repos} | tickets: {tickets})\t{search_blob}"
 
 
 def cmd_list(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) -> int:
@@ -1535,7 +1709,8 @@ def cmd_list(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) ->
     for t in tasks:
         repos = ", ".join(w["repo"] for w in t.get("worktrees", [])) or "none"
         res_cnt = len(t.get("resources", []))
-        print(f"{t['id']:36} | ws: {str(t.get('workspace_id') or '-'):5} | repos: {repos:25} | resources: {res_cnt} | {t.get('title', '')}")
+        st = (t.get("status") or "in_progress").upper()
+        print(f"{t['id']:32} | {st:11} | ws: {str(t.get('workspace_id') or '-'):5} | repos: {repos:24} | resources: {res_cnt} | {t.get('title', '')}")
     return 0
 
 
@@ -1750,6 +1925,29 @@ def cmd_update(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) 
             task["brief"] = None if new_brief.strip() == "-" else new_brief.strip()
             messages.append("Updated task brief")
 
+        new_status = getattr(args, "status", None)
+        if new_status is not None and new_status.strip():
+            norm_st = new_status.strip().lower().replace("-", "_").replace(" ", "_")
+            if norm_st not in VALID_TASK_STATUSES:
+                print(
+                    f"Error: invalid status '{new_status}'. Choose from: {', '.join(VALID_TASK_STATUSES)}",
+                    file=sys.stderr,
+                )
+                return 1
+            old_status = task.get("status") or "in_progress"
+            if norm_st != old_status:
+                task["status"] = norm_st
+                messages.append(f"Updated task status: '{old_status}' -> '{norm_st}'")
+                _, auto_msgs = dispatch_automation_event(
+                    "task.status_changed",
+                    task,
+                    paths,
+                    cfg,
+                    previous_status=old_status,
+                    new_status=norm_st,
+                )
+                messages.extend(auto_msgs)
+
         new_def_branch = getattr(args, "branch", None)
         if new_def_branch is not None and new_def_branch.strip():
             task["default_branch"] = new_def_branch.strip()
@@ -1804,6 +2002,84 @@ def cmd_update(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) 
     else:
         for m in messages or [f"Task '{tid}' is up to date."]:
             print(f"• {m}")
+    return 0
+
+
+def cmd_sync(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) -> int:
+    tid = resolve_current_task_id(paths, getattr(args, "task_id", None) or getattr(args, "task", None))
+    if not tid:
+        print("Error: could not resolve task to sync. Pass <task-id>.", file=sys.stderr)
+        return 1
+
+    messages: list[str] = []
+    with task_store_lock(paths):
+        task = load_task(paths, tid)
+        if not task:
+            print(f"Error: task '{tid}' not found.", file=sys.stderr)
+            return 1
+
+        modified = False
+        # 1. Refresh GitHub PR metadata
+        for r in task.get("resources", []):
+            if r.get("category") == "pull_request" and r.get("url"):
+                m = GH_PR_URL_RE.search(r["url"])
+                if m:
+                    gh_meta = fetch_github_pr_metadata(m.group(1), m.group(2), m.group(3))
+                    if gh_meta:
+                        if gh_meta.get("status") and r.get("status") != gh_meta["status"]:
+                            r["status"] = gh_meta["status"]
+                            modified = True
+                        if gh_meta.get("branch"):
+                            r.setdefault("metadata", {})["branch"] = gh_meta["branch"]
+                        messages.append(f"[github] Synced {r.get('ref')} -> [{r.get('status') or 'OPEN'}]")
+
+        # 2. Dispatch `task.sync` to all modular automations (e.g. jira_status_sync)
+        auto_mod, auto_msgs = dispatch_automation_event("task.sync", task, paths, cfg)
+        if auto_mod:
+            modified = True
+        messages.extend(auto_msgs)
+
+        if modified:
+            task["updated_at"] = now_iso()
+            atomic_write_json(paths.task_file(tid), task)
+
+    if not getattr(args, "no_herdr", False) and task.get("workspace_id"):
+        HerdrClient(cfg).sync_sidebar_metadata(task)
+
+    if getattr(args, "json", False):
+        print(json.dumps({"task": task, "messages": messages}, indent=2))
+    else:
+        for m in messages or [f"Task '{tid}' is up to date."]:
+            print(f"• {m}")
+    return 0
+
+
+def cmd_automations(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) -> int:
+    autos = discover_automations(paths, cfg)
+    out_list = [
+        {
+            "id": a["id"],
+            "enabled": a["enabled"],
+            "description": a["description"],
+            "events": a["events"],
+            "path": a["path"],
+        }
+        for a in autos
+    ]
+    if getattr(args, "json", False):
+        print(json.dumps(out_list, indent=2))
+        return 0
+
+    if not out_list:
+        print("No lifecycle automation modules found.")
+        return 0
+
+    for a in out_list:
+        st_str = "ENABLED" if a["enabled"] else "DISABLED"
+        ev_str = ", ".join(a["events"])
+        print(f"• {a['id']:22} [{st_str:8}] — {a['description']}")
+        print(f"  events: {ev_str}")
+        print(f"  path:   {a['path']}")
     return 0
 
 
@@ -2059,22 +2335,34 @@ def cmd_cleanup(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any])
         delete_branches=bool(getattr(args, "delete_branches", False)),
     )
 
+    auto_msgs: list[str] = []
     with task_store_lock(paths):
         fresh_task = load_task(paths, tid)
         if fresh_task:
             task = fresh_task
+        old_status = task.get("status") or "in_progress"
         task["status"] = "archived"
         task["archived_at"] = now_iso()
         task["updated_at"] = now_iso()
+        _, auto_msgs = dispatch_automation_event(
+            "task.cleanup",
+            task,
+            paths,
+            cfg,
+            previous_status=old_status,
+            new_status="archived",
+        )
         atomic_write_json(paths.archive_file(tid), task)
         active_file = paths.task_file(tid)
         if active_file.exists():
             active_file.unlink()
 
     if getattr(args, "json", False):
-        print(json.dumps({"archived": tid, "status": "archived"}, indent=2))
+        print(json.dumps({"archived": tid, "status": "archived", "messages": auto_msgs}, indent=2))
     else:
         print(f"Cleaned up and archived task '{tid}'.")
+        for m in auto_msgs:
+            print(f"  ↳ {m}")
     return 0
 
 
@@ -2493,6 +2781,56 @@ def cmd_popup_action(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, 
             sys.stdin.readline()
         return 0
 
+    if action == "set-status":
+        task = load_task(paths, tid)
+        if not task:
+            return 1
+        cur_st = (task.get("status") or "in_progress").lower()
+        status_items = [
+            f"{st}\t{TASK_STATUS_ICONS.get(st, '•')} {st.upper()}"
+            + ("  (current)" if st == cur_st else "")
+            for st in ("todo", "in_progress", "in_review", "done")
+        ]
+        res = subprocess.run(
+            [
+                fzf_bin,
+                "--delimiter=\t",
+                "--with-nth=2",
+                f"--prompt=Task Status ({tid}) > ",
+                f"--header=Transition '{task.get('title', tid)}' (runs lifecycle automations e.g. Jira status sync):",
+            ],
+            input="\n".join(status_items),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            return 0
+        chosen_st = res.stdout.strip().split("\t", 1)[0].strip()
+        return cmd_update(
+            argparse.Namespace(
+                task_id=tid,
+                task=tid,
+                title=None,
+                brief=None,
+                status=chosen_st,
+                branch=None,
+                repo_branch=None,
+                sync_pr_branches=False,
+                no_herdr=False,
+                json=False,
+            ),
+            paths,
+            cfg,
+        )
+
+    if action == "sync-task":
+        return cmd_sync(
+            argparse.Namespace(task_id=tid, task=tid, no_herdr=False, json=False),
+            paths,
+            cfg,
+        )
+
     if action == "pilot":
         tasks_count = len(list_all_tasks(paths))
         header_text = (
@@ -2555,6 +2893,7 @@ def cmd_popup_action(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, 
                     id=None,
                     title=q_title,
                     brief=q_brief,
+                    task_status="in_progress",
                     repos=q_repos or None,
                     repo_list=None,
                     branch=q_branch,
@@ -2628,12 +2967,16 @@ def cmd_popup_action(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, 
             print(f"Task '{tid}' not found.")
             return 1
 
-        print(f"\n--- ✏️ Edit Task Metadata & Worktree Branches ['{tid}'] ---")
+        print(f"\n--- ✏️ Edit Task Metadata, Status & Worktree Branches ['{tid}'] ---")
         print("Press Enter to keep current value, or type '-' to clear brief.\n")
 
         cur_title = task.get("title") or ""
         print(f"Task Title [{cur_title}]: ", end="", flush=True)
         new_title = sys.stdin.readline().strip()
+
+        cur_status = task.get("status") or "in_progress"
+        print(f"Task Status ({'/'.join(VALID_TASK_STATUSES[:4])}) [{cur_status}]: ", end="", flush=True)
+        new_status = sys.stdin.readline().strip()
 
         cur_brief = task.get("brief") or ""
         print(f"Task Brief [{cur_brief or 'none'}]: ", end="", flush=True)
@@ -2654,6 +2997,7 @@ def cmd_popup_action(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, 
                 task=tid,
                 title=new_title if new_title else None,
                 brief=new_brief if new_brief else None,
+                status=new_status if new_status else None,
                 branch=None,
                 repo_branch=repo_branches,
                 sync_pr_branches=False,
@@ -2679,7 +3023,10 @@ def cmd_popup(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) -
             cfg,
         )
 
-    header = "[Enter] Resources   [Ctrl-P] Task Pilot   [Ctrl-E] Edit Task   [Ctrl-N] New Task   [Ctrl-A] +Repo   [Ctrl-X] Cleanup"
+    header = (
+        "[Enter] Resources  [Ctrl-S] Status  [Ctrl-R] Sync  "
+        "[Ctrl-P] Pilot  [Ctrl-E] Edit  [Ctrl-N] New  [Ctrl-A] +Repo  [Ctrl-X] Cleanup"
+    )
 
     while True:
         tasks = list_all_tasks(paths)
@@ -2697,6 +3044,8 @@ def cmd_popup(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) -
             "--prompt", "Task Info & Resources > ",
             "--preview", f"{self_bin} status {{1}} --color",
             "--preview-window", "down:64%:wrap",
+            "--bind", f"ctrl-s:execute({self_bin} _popup-action set-status {{1}})+reload({self_bin} list --fzf)",
+            "--bind", f"ctrl-r:execute({self_bin} _popup-action sync-task {{1}})+reload({self_bin} list --fzf)",
             "--bind", f"ctrl-p:execute({self_bin} _popup-action task-pilot {{1}})+reload({self_bin} list --fzf)",
             "--bind", f"ctrl-e:execute({self_bin} _popup-action edit-task {{1}})+reload({self_bin} list --fzf)",
             "--bind", f"ctrl-a:execute({self_bin} _popup-action add-repo {{1}})+reload({self_bin} list --fzf)",
@@ -2741,6 +3090,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_create.add_argument("--id", help="Explicit task ID slug (e.g. PLA-4350-rabbitmq)")
     p_create.add_argument("--title", help="Human-readable task title")
     p_create.add_argument("--brief", help="Concise technical brief")
+    p_create.add_argument("--task-status", dest="task_status", choices=VALID_TASK_STATUSES, default="in_progress", help="Initial task lifecycle status")
     p_create.add_argument("--repos", help="Comma-separated list of repository names or paths")
     p_create.add_argument("--repo", dest="repo_list", action="append", help="Repository name or path (repeatable)")
     p_create.add_argument("--branch", help="Git branch name across repositories")
@@ -2755,11 +3105,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # update / edit
     for name in ("update", "edit"):
-        p_upd = sub.add_parser(name, help="Update task title, brief, default branch, or switch worktree branches")
+        p_upd = sub.add_parser(name, help="Update task title, status, brief, default branch, or switch worktree branches")
         p_upd.add_argument("task_id", nargs="?", help="Task ID (defaults to ambient task)")
         p_upd.add_argument("--task", help="Task ID (alternative flag)")
         p_upd.add_argument("--title", help="Update human-readable task title (also renames Herdr workspace)")
         p_upd.add_argument("--brief", help="Update technical brief (pass '-' to clear)")
+        p_upd.add_argument("--status", help=f"Update task lifecycle status ({', '.join(VALID_TASK_STATUSES)}) and run automations")
         p_upd.add_argument("--branch", help="Update default_branch (and switch single-repo worktree)")
         p_upd.add_argument(
             "--repo-branch",
@@ -2775,6 +3126,18 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p_upd.add_argument("--no-herdr", action="store_true")
         p_upd.add_argument("--json", action="store_true")
+
+    # sync
+    p_sync_task = sub.add_parser("sync", help="Bidirectionally sync task & resource statuses (Jira, GitHub PRs)")
+    p_sync_task.add_argument("task_id", nargs="?", help="Task ID (defaults to ambient task)")
+    p_sync_task.add_argument("--task", help="Task ID (alternative flag)")
+    p_sync_task.add_argument("--no-herdr", action="store_true")
+    p_sync_task.add_argument("--json", action="store_true")
+
+    # automations
+    p_auto = sub.add_parser("automations", help="Inspect modular lifecycle automations")
+    p_auto.add_argument("auto_action", nargs="?", default="list", choices=["list"], help="Automation subcommand")
+    p_auto.add_argument("--json", action="store_true")
 
     # current
     p_curr = sub.add_parser("current", help="Resolve active task ID from HERDR_TASK_ID, HERDR_WORKSPACE_ID, or PWD")
@@ -2887,6 +3250,8 @@ def build_parser() -> argparse.ArgumentParser:
             "pilot",
             "task-pilot",
             "edit-task",
+            "set-status",
+            "sync-task",
             "add-resource",
             "resources",
             "list-resources",
@@ -2913,6 +3278,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_create(args, paths, cfg)
     if cmd in ("update", "edit"):
         return cmd_update(args, paths, cfg)
+    if cmd == "sync":
+        return cmd_sync(args, paths, cfg)
+    if cmd == "automations":
+        return cmd_automations(args, paths, cfg)
     if cmd == "current":
         return cmd_current(args, paths, cfg)
     if cmd == "list":
