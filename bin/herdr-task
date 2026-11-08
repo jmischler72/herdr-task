@@ -159,6 +159,7 @@ class TaskPaths:
         self.base = Path(os.path.expanduser(str(raw))).resolve()
         self.archive = self.base / "archive"
         self.user_automations = self.base / "automations"
+        self.user_integrations = self.base / "integrations"
         self.lock_file = self.base / ".lock"
         self.config_file = self.base / "config.json"
 
@@ -171,6 +172,19 @@ class TaskPaths:
         script_rel = Path(__file__).resolve().parent.parent / "automations"
         builtin_plugin = Path(os.path.expanduser("~/.config/herdr/tasks/plugin/automations"))
         for cand in (script_rel, builtin_plugin, self.base / "plugin" / "automations", self.user_automations):
+            try:
+                resolved = cand.resolve()
+                if resolved.is_dir() and resolved not in dirs:
+                    dirs.append(resolved)
+            except Exception:
+                continue
+        return dirs
+
+    def integration_search_dirs(self) -> list[Path]:
+        dirs: list[Path] = []
+        script_rel = Path(__file__).resolve().parent.parent / "integrations"
+        builtin_plugin = Path(os.path.expanduser("~/.config/herdr/tasks/plugin/integrations"))
+        for cand in (script_rel, builtin_plugin, self.base / "plugin" / "integrations", self.user_integrations):
             try:
                 resolved = cand.resolve()
                 if resolved.is_dir() and resolved not in dirs:
@@ -204,8 +218,9 @@ def load_config(paths: TaskPaths) -> dict[str, Any]:
             user_cfg = json.loads(paths.config_file.read_text(encoding="utf-8"))
             if isinstance(user_cfg, dict):
                 user_autos = user_cfg.get("automations")
+                user_integs = user_cfg.get("integrations")
                 for k, v in user_cfg.items():
-                    if k != "automations":
+                    if k not in ("automations", "integrations"):
                         cfg[k] = v
                 if isinstance(user_autos, dict):
                     cfg_autos = cfg.setdefault("automations", {})
@@ -214,6 +229,13 @@ def load_config(paths: TaskPaths) -> dict[str, Any]:
                             cfg_autos.setdefault(auto_id, {}).update(auto_conf)
                         else:
                             cfg_autos[auto_id] = auto_conf
+                if isinstance(user_integs, dict):
+                    cfg_integs = cfg.setdefault("integrations", {})
+                    for integ_id, integ_conf in user_integs.items():
+                        if isinstance(integ_conf, dict):
+                            cfg_integs.setdefault(integ_id, {}).update(integ_conf)
+                        else:
+                            cfg_integs[integ_id] = integ_conf
         except Exception:
             pass
     env_wt = os.environ.get("HERDR_WORKTREES_DIR", "").strip()
@@ -317,6 +339,199 @@ def dispatch_automation_event(
     return any_modified, messages
 
 
+# ---------------------------------------------------------------------------
+# Modular Integration & Predefined Value Engine
+# ---------------------------------------------------------------------------
+
+def discover_integrations(paths: TaskPaths, cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Discovers modular integrations from `integrations/*.py` and `automations/*.py`
+    that expose `provide_candidates`, `provide_field_options`, or `enrich_resource`.
+    """
+    discovered_by_id: dict[str, dict[str, Any]] = {}
+    user_auto_cfg = cfg.get("automations") if isinstance(cfg.get("automations"), dict) else {}
+    user_integ_cfg = cfg.get("integrations") if isinstance(cfg.get("integrations"), dict) else {}
+
+    search_dirs: list[Path] = []
+    for d in (*paths.automation_search_dirs(), *paths.integration_search_dirs()):
+        if d not in search_dirs:
+            search_dirs.append(d)
+
+    for folder in search_dirs:
+        for py_file in sorted(folder.glob("*.py")):
+            if py_file.name.startswith("_"):
+                continue
+            mod_name = f"herdr_task_integ_{py_file.stem}"
+            try:
+                spec = importlib.util.spec_from_file_location(mod_name, str(py_file))
+                if not spec or not spec.loader:
+                    continue
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+            except Exception:
+                continue
+
+            cand_fn = getattr(mod, "provide_candidates", None)
+            opt_fn = getattr(mod, "provide_field_options", None)
+            enrich_fn = getattr(mod, "enrich_resource", None)
+            if not any(callable(fn) for fn in (cand_fn, opt_fn, enrich_fn)):
+                continue
+
+            integ_id = str(
+                getattr(mod, "INTEGRATION_ID", None)
+                or getattr(mod, "AUTOMATION_ID", None)
+                or py_file.stem
+            ).strip()
+            auto_id = str(getattr(mod, "AUTOMATION_ID", integ_id)).strip()
+            description = str(getattr(mod, "DESCRIPTION", "")).strip()
+            default_settings = getattr(mod, "DEFAULT_SETTINGS", {})
+            settings: dict[str, Any] = (
+                json.loads(json.dumps(default_settings)) if isinstance(default_settings, dict) else {}
+            )
+
+            for ovr_source in (user_auto_cfg.get(auto_id), user_auto_cfg.get(integ_id), user_integ_cfg.get(integ_id)):
+                if isinstance(ovr_source, bool):
+                    settings["enabled"] = ovr_source
+                elif isinstance(ovr_source, dict):
+                    for sk, sv in ovr_source.items():
+                        if sk == "status_map" and isinstance(sv, dict) and isinstance(settings.get("status_map"), dict):
+                            settings["status_map"].update(sv)
+                        else:
+                            settings[sk] = sv
+
+            caps: list[str] = []
+            if callable(cand_fn):
+                caps.append("candidates")
+            if callable(opt_fn):
+                caps.append("field_options")
+            if callable(enrich_fn):
+                caps.append("enrich_resource")
+
+            discovered_by_id[integ_id] = {
+                "id": integ_id,
+                "description": description,
+                "capabilities": caps,
+                "enabled": bool(settings.get("enabled", True)),
+                "path": str(py_file),
+                "settings": settings,
+                "module": mod,
+            }
+
+    return list(discovered_by_id.values())
+
+
+def query_integration_candidates(
+    kind: str,
+    paths: TaskPaths,
+    cfg: dict[str, Any],
+    **extra_context: Any,
+) -> list[dict[str, Any]]:
+    integrations = discover_integrations(paths, cfg)
+    all_tasks = extra_context.pop("all_tasks", None)
+    if all_tasks is None:
+        all_tasks = list_all_tasks(paths, include_archived=True)
+
+    context: dict[str, Any] = {
+        "kind": kind,
+        "paths": paths,
+        "config": cfg,
+        "all_tasks": all_tasks,
+        **extra_context,
+    }
+
+    out: list[dict[str, Any]] = []
+    seen_values: set[str] = set()
+    for integ in integrations:
+        if not integ["enabled"]:
+            continue
+        fn = getattr(integ["module"], "provide_candidates", None)
+        if not callable(fn):
+            continue
+        try:
+            items = fn(kind, context, integ["settings"]) or []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                val = str(item.get("value") or "").strip()
+                if not val or val in seen_values:
+                    continue
+                seen_values.add(val)
+                item_copy = dict(item)
+                item_copy.setdefault("integration_id", integ["id"])
+                out.append(item_copy)
+        except Exception:
+            continue
+    return out
+
+
+def query_integration_field_options(
+    field: str,
+    paths: TaskPaths,
+    cfg: dict[str, Any],
+    **extra_context: Any,
+) -> list[dict[str, Any]]:
+    integrations = discover_integrations(paths, cfg)
+    context: dict[str, Any] = {
+        "field": field,
+        "paths": paths,
+        "config": cfg,
+        **extra_context,
+    }
+
+    out: list[dict[str, Any]] = []
+    seen_values: set[str] = set()
+    for integ in integrations:
+        if not integ["enabled"]:
+            continue
+        fn = getattr(integ["module"], "provide_field_options", None)
+        if not callable(fn):
+            continue
+        try:
+            items = fn(field, context, integ["settings"]) or []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                val = str(item.get("value") or "").strip()
+                if not val or val in seen_values:
+                    continue
+                seen_values.add(val)
+                item_copy = dict(item)
+                item_copy.setdefault("integration_id", integ["id"])
+                out.append(item_copy)
+        except Exception:
+            continue
+    return out
+
+
+def enrich_draft_resource_via_integrations(
+    res: dict[str, Any],
+    paths: TaskPaths,
+    cfg: dict[str, Any],
+    task: dict[str, Any] | None = None,
+) -> list[str]:
+    integrations = discover_integrations(paths, cfg)
+    context: dict[str, Any] = {
+        "resource": res,
+        "task": task or {},
+        "paths": paths,
+        "config": cfg,
+    }
+    messages: list[str] = []
+    for integ in integrations:
+        if not integ["enabled"]:
+            continue
+        fn = getattr(integ["module"], "enrich_resource", None)
+        if not callable(fn):
+            continue
+        try:
+            ret = fn(res, context, integ["settings"])
+            if isinstance(ret, dict) and ret.get("message"):
+                messages.append(f"[{integ['id']}] {ret['message']}")
+        except Exception:
+            continue
+    return messages
+
+
 @contextmanager
 def task_store_lock(paths: TaskPaths):
     paths.ensure_dirs()
@@ -353,7 +568,11 @@ def load_task(paths: TaskPaths, task_id: str, include_archived: bool = False) ->
     f = paths.task_file(task_id)
     if f.exists():
         try:
-            return json.loads(f.read_text(encoding="utf-8"))
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                if data.get("status") == "archived" and not include_archived:
+                    return None
+                return data
         except Exception:
             return None
     if include_archived:
@@ -376,6 +595,8 @@ def list_all_tasks(paths: TaskPaths, include_archived: bool = False) -> list[dic
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(data, dict) and is_valid_task_id(data.get("id")):
+                if data.get("status") == "archived" and not include_archived:
+                    continue
                 tasks.append(data)
                 seen_ids.add(data["id"])
         except Exception:
@@ -391,6 +612,18 @@ def list_all_tasks(paths: TaskPaths, include_archived: bool = False) -> list[dic
                 continue
     tasks.sort(key=lambda t: t.get("updated_at") or t.get("created_at") or "", reverse=True)
     return tasks
+
+
+def collect_active_worktree_paths(paths: TaskPaths, exclude_task_id: str | None = None) -> set[str]:
+    used: set[str] = set()
+    for t in list_all_tasks(paths, include_archived=False):
+        if exclude_task_id and t.get("id") == exclude_task_id:
+            continue
+        for wt in t.get("worktrees", []):
+            wp = wt.get("worktree_path")
+            if wp:
+                used.add(os.path.realpath(wp))
+    return used
 
 
 def resolve_current_task_id(
@@ -474,8 +707,44 @@ JIRA_KEY_RE = re.compile(r"^([A-Z][A-Z0-9_]{1,15}-\d+)$")
 JIRA_URL_RE = re.compile(r"/browse/([A-Z][A-Z0-9_]{1,15}-\d+)")
 GH_PR_URL_RE = re.compile(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)")
 GH_ISSUE_URL_RE = re.compile(r"github\.com/([^/]+)/([^/]+)/issues/(\d+)")
-GH_SHORT_RE = re.compile(r"^([A-Za-z0-9._-]+)#(\d+)$")
+GH_SHORT_RE = re.compile(r"^(?:([A-Za-z0-9._-]+)/)?([A-Za-z0-9._-]+)#(\d+)$")
+GH_REMOTE_ORG_RE = re.compile(r"github\.com[:/]([^/]+)/([^/.]+?)(?:\.git)?$")
 SLACK_URL_RE = re.compile(r"https?://([a-zA-Z0-9_-]+)\.slack\.com/archives/([A-Z0-9]+)/p(\d+)")
+
+IGNORED_JIRA_PREFIXES = {
+    "UTF", "SHA", "AES", "RSA", "TLS", "SSL", "HTTP", "HTTPS", "IPV",
+    "CVE", "ISO", "RFC", "PEP", "PR", "GH", "V1", "V2", "V3", "RC",
+    "ARM", "AMD", "X86", "JDK", "NODE", "CPU", "GPU", "RAM", "SQL",
+}
+
+
+def _extract_jira_key_from_text(text: str | None) -> str | None:
+    if not text:
+        return None
+    for m_jk in re.finditer(r"\b([A-Z][A-Z0-9_]{1,15})-(\d+)\b", text):
+        prefix = m_jk.group(1)
+        if prefix not in IGNORED_JIRA_PREFIXES:
+            return f"{prefix}-{m_jk.group(2)}"
+    return None
+
+
+def _infer_github_org_for_repo(repo_name: str, cfg: dict[str, Any]) -> str | None:
+    try:
+        _, repo_path = resolve_repo_path(repo_name, cfg)
+        res = subprocess.run(
+            ["git", "-C", str(repo_path), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            m = GH_REMOTE_ORG_RE.search(res.stdout.strip())
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return None
 
 
 def fetch_github_pr_metadata(org: str, repo: str, num: str) -> dict[str, Any]:
@@ -520,9 +789,8 @@ def fetch_github_pr_metadata(org: str, repo: str, num: str) -> dict[str, Any]:
 
         jira_key = None
         for text_cand in (pr_title, head_ref, body[:400]):
-            m_jk = re.search(r"\b([A-Z][A-Z0-9]{1,9}-\d+)\b", text_cand or "")
-            if m_jk:
-                jira_key = m_jk.group(1)
+            jira_key = _extract_jira_key_from_text(text_cand)
+            if jira_key:
                 break
 
         return {
@@ -580,15 +848,22 @@ def classify_resource(
         det_prov = det_prov or "jira"
         ref = key
         default_label = key
-    elif m_gh_pr:
-        org, repo, num = m_gh_pr.group(1), m_gh_pr.group(2), m_gh_pr.group(3)
+    elif m_gh_pr or m_gh_short:
+        if m_gh_pr:
+            org, repo, num = m_gh_pr.group(1), m_gh_pr.group(2), m_gh_pr.group(3)
+        else:
+            assert m_gh_short is not None
+            org = m_gh_short.group(1) or meta_out.get("org") or _infer_github_org_for_repo(m_gh_short.group(2), cfg)
+            repo, num = m_gh_short.group(2), m_gh_short.group(3)
+            url = f"https://github.com/{org}/{repo}/pull/{num}" if org else ""
         det_cat = det_cat or "pull_request"
         det_prov = det_prov or "github"
         ref = f"{repo}#{num}"
         meta_out.setdefault("repo", repo)
-        meta_out.setdefault("org", org)
+        if org:
+            meta_out.setdefault("org", org)
         default_label = f"{repo} #{num}"
-        if fetch_remote and not (label and status and summary and meta_out.get("branch")):
+        if org and fetch_remote and not (label and status and summary and meta_out.get("branch")):
             pr_meta = fetch_github_pr_metadata(org, repo, num)
             if pr_meta:
                 if not label and pr_meta.get("title"):
@@ -605,17 +880,13 @@ def classify_resource(
                 if pr_meta.get("jira_key"):
                     meta_out["jira_key"] = pr_meta["jira_key"]
     elif m_gh_issue:
-        _, repo, num = m_gh_issue.group(1), m_gh_issue.group(2), m_gh_issue.group(3)
+        org, repo, num = m_gh_issue.group(1), m_gh_issue.group(2), m_gh_issue.group(3)
         det_cat = det_cat or "issue"
         det_prov = det_prov or "github"
         ref = f"{repo}#{num}"
+        meta_out.setdefault("repo", repo)
+        meta_out.setdefault("org", org)
         default_label = f"{repo} issue #{num}"
-    elif m_gh_short:
-        repo, num = m_gh_short.group(1), m_gh_short.group(2)
-        det_cat = det_cat or "pull_request"
-        det_prov = det_prov or "github"
-        ref = f"{repo}#{num}"
-        default_label = f"{repo} #{num}"
     elif m_slack:
         team_slug, chan_id, ts_raw = m_slack.group(1), m_slack.group(2), m_slack.group(3)
         det_cat = det_cat or "conversation"
@@ -784,7 +1055,13 @@ def _detach_worktree_if_clean(wt_path: str) -> bool:
     return res.returncode == 0
 
 
-def switch_worktree_branch(wt: dict[str, Any], target_branch: str, cfg: dict[str, Any]) -> tuple[bool, str]:
+def switch_worktree_branch(
+    wt: dict[str, Any],
+    target_branch: str,
+    cfg: dict[str, Any],
+    task_id: str | None = None,
+    force: bool = False,
+) -> tuple[bool, str]:
     """
     Switches a registered task worktree to `target_branch` in-place via `git checkout`.
     Never moves the worktree directory on disk, so running panes keep a valid $PWD.
@@ -802,10 +1079,19 @@ def switch_worktree_branch(wt: dict[str, Any], target_branch: str, cfg: dict[str
 
     cur_wt_path = Path(wt.get("worktree_path") or "")
     if not cur_wt_path.exists():
-        info = ensure_git_worktree(repo_name, target_branch, cfg, task_id=wt.get("task_id"))
+        info = ensure_git_worktree(repo_name, target_branch, cfg, task_id=task_id or wt.get("task_id"))
         wt["worktree_path"] = info["worktree_path"]
         wt["branch"] = info["branch"]
         return True, f"Provisioned worktree for {repo_name} on '{wt['branch']}' at {wt['worktree_path']}"
+
+    if not force:
+        safety = check_worktree_safety(str(cur_wt_path))
+        if not safety["clean"]:
+            return (
+                False,
+                f"Worktree for '{repo_name}' has uncommitted changes ({len(safety['dirty_files'])} files); "
+                "commit/stash first or pass --force",
+            )
 
     real_cur = os.path.realpath(str(cur_wt_path))
     for gwt in list_git_worktrees(repo_path):
@@ -824,7 +1110,7 @@ def switch_worktree_branch(wt: dict[str, Any], target_branch: str, cfg: dict[str
     if git_ref_exists(repo_path, f"refs/heads/{target_branch}"):
         co_cmd = ["git", "-C", str(cur_wt_path), "checkout", target_branch]
     elif git_ref_exists(repo_path, f"refs/remotes/origin/{target_branch}"):
-        co_cmd = ["git", "-C", str(cur_wt_path), "checkout", "--track", "-B", target_branch, f"origin/{target_branch}"]
+        co_cmd = ["git", "-C", str(cur_wt_path), "checkout", "--track", "-b", target_branch, f"origin/{target_branch}"]
     else:
         co_cmd = ["git", "-C", str(cur_wt_path), "checkout", "-b", target_branch]
 
@@ -873,7 +1159,9 @@ def ensure_git_worktree(
         )
         cur_b = res.stdout.strip() if res.returncode == 0 else ""
         if cur_b and cur_b != branch and check_worktree_safety(str(target_wt_path))["clean"]:
-            switch_worktree_branch(wt_obj, branch, cfg)
+            ok, _ = switch_worktree_branch(wt_obj, branch, cfg, task_id=task_id)
+            if not ok:
+                wt_obj["branch"] = cur_b
         else:
             wt_obj["branch"] = cur_b or branch
         return wt_obj
@@ -1217,11 +1505,9 @@ def cmd_create(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) 
     title = spec.get("title") or getattr(args, "title", None) or "Untitled Task"
     raw_id = spec.get("id") or getattr(args, "id", None)
     brief = spec.get("brief") or getattr(args, "brief", None)
-    initial_task_status = (
-        spec.get("status")
-        or getattr(args, "task_status", None)
-        or "in_progress"
-    )
+    raw_status = spec.get("status") or getattr(args, "task_status", None)
+    explicit_task_status = bool(raw_status)
+    initial_task_status = raw_status or "in_progress"
     if initial_task_status not in VALID_TASK_STATUSES:
         initial_task_status = "in_progress"
 
@@ -1317,8 +1603,6 @@ def cmd_create(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) 
         # Reserve the task ID atomically before provisioning worktrees/workspaces
         atomic_write_json(paths.task_file(task_id), task)
 
-    _, auto_msgs = dispatch_automation_event("task.created", task, paths, cfg)
-
     repos: list[str] = []
     if "repos" in spec and isinstance(spec["repos"], list):
         for r in spec["repos"]:
@@ -1350,7 +1634,7 @@ def cmd_create(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) 
                 pass
 
     worktrees: list[dict[str, Any]] = []
-    used_wt_paths: set[str] = set()
+    used_wt_paths: set[str] = collect_active_worktree_paths(paths, exclude_task_id=task_id)
     try:
         for r_name in repos:
             r_short_guess = Path(r_name).name
@@ -1380,6 +1664,13 @@ def cmd_create(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) 
         raise
 
     task["worktrees"] = worktrees
+    _, auto_msgs = dispatch_automation_event(
+        "task.created",
+        task,
+        paths,
+        cfg,
+        explicit_task_status=explicit_task_status,
+    )
 
     if not getattr(args, "no_herdr", False):
         herdr = HerdrClient(cfg)
@@ -1500,10 +1791,9 @@ def cmd_link(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) ->
             for wt in task.get("worktrees", []):
                 if wt.get("repo") == pr_repo and wt.get("branch") != pr_branch:
                     if getattr(args, "sync_branch", False) or wt.get("branch") in placeholders:
-                        if check_worktree_safety(wt.get("worktree_path", ""))["clean"]:
-                            ok, msg = switch_worktree_branch(wt, pr_branch, cfg)
-                            if ok:
-                                branch_switch_msg = msg
+                        ok, msg = switch_worktree_branch(wt, pr_branch, cfg, task_id=tid, force=False)
+                        if ok:
+                            branch_switch_msg = msg
                     break
 
         task["updated_at"] = now_iso()
@@ -1720,34 +2010,43 @@ def cmd_focus(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) -
         print("Error: could not resolve task.", file=sys.stderr)
         return 1
 
-    with task_store_lock(paths):
-        task = load_task(paths, tid)
-        if not task:
-            print(f"Error: task '{tid}' not found.", file=sys.stderr)
-            return 1
+    task = load_task(paths, tid)
+    if not task:
+        print(f"Error: task '{tid}' not found.", file=sys.stderr)
+        return 1
 
-        herdr = HerdrClient(cfg)
-        live_ws_ids = {w.get("workspace_id") for w in herdr.list_workspaces()}
-        ws_id = task.get("workspace_id")
+    herdr = HerdrClient(cfg)
+    live_ws_ids = {w.get("workspace_id") for w in herdr.list_workspaces()}
+    ws_id = task.get("workspace_id")
 
-        if not ws_id or ws_id not in live_ws_ids:
-            provision_herdr_workspace_for_task(herdr, task, focus=True, cfg=cfg)
-            atomic_write_json(paths.task_file(tid), task)
-            ws_id = task.get("workspace_id")
-        else:
-            live_tab_ids = {t.get("tab_id") for t in herdr.list_tabs(ws_id)}
-            updated = False
-            for wt in task.get("worktrees", []):
-                if (not wt.get("tab_id") or wt["tab_id"] not in live_tab_ids) and Path(wt["worktree_path"]).exists():
-                    t_res = herdr.create_tab(ws_id, wt["worktree_path"], wt["repo"], tid, focus=False)
-                    if t_res:
-                        wt["tab_id"] = (t_res.get("tab") or {}).get("tab_id")
-                        _provision_tab_cockpit(herdr, wt, (t_res.get("root_pane") or {}).get("pane_id"), cfg)
-                        updated = True
-            if updated:
-                atomic_write_json(paths.task_file(tid), task)
-            herdr.focus_workspace(ws_id)
-            herdr.sync_sidebar_metadata(task)
+    if not ws_id or ws_id not in live_ws_ids:
+        provision_herdr_workspace_for_task(herdr, task, focus=True, cfg=cfg)
+        with task_store_lock(paths):
+            fresh = load_task(paths, tid) or task
+            fresh["workspace_id"] = task.get("workspace_id")
+            fresh["worktrees"] = task.get("worktrees", [])
+            fresh["updated_at"] = now_iso()
+            atomic_write_json(paths.task_file(tid), fresh)
+            task = fresh
+    else:
+        live_tab_ids = {t.get("tab_id") for t in herdr.list_tabs(ws_id)}
+        updated = False
+        for wt in task.get("worktrees", []):
+            if (not wt.get("tab_id") or wt["tab_id"] not in live_tab_ids) and Path(wt["worktree_path"]).exists():
+                t_res = herdr.create_tab(ws_id, wt["worktree_path"], wt["repo"], tid, focus=False)
+                if t_res:
+                    wt["tab_id"] = (t_res.get("tab") or {}).get("tab_id")
+                    _provision_tab_cockpit(herdr, wt, (t_res.get("root_pane") or {}).get("pane_id"), cfg)
+                    updated = True
+        if updated:
+            with task_store_lock(paths):
+                fresh = load_task(paths, tid) or task
+                fresh["worktrees"] = task.get("worktrees", [])
+                fresh["updated_at"] = now_iso()
+                atomic_write_json(paths.task_file(tid), fresh)
+                task = fresh
+        herdr.focus_workspace(ws_id)
+        herdr.sync_sidebar_metadata(task)
 
     target_repo = getattr(args, "repo", None)
     if target_repo and task.get("workspace_id"):
@@ -1783,63 +2082,88 @@ def cmd_worktree_add(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, 
             None,
         )
         if existing_same and Path(existing_same.get("worktree_path", "")).exists():
-            if not getattr(args, "no_herdr", False) and task.get("workspace_id"):
-                herdr = HerdrClient(cfg)
-                live_tab_ids = {t.get("tab_id") for t in herdr.list_tabs(task["workspace_id"])}
-                if not existing_same.get("tab_id") or existing_same["tab_id"] not in live_tab_ids:
-                    t_res = herdr.create_tab(
-                        task["workspace_id"],
-                        existing_same["worktree_path"],
-                        existing_same.get("tab_title") or repo_short,
-                        tid,
-                        focus=bool(getattr(args, "focus", False)),
-                    )
-                    if t_res:
-                        existing_same["tab_id"] = (t_res.get("tab") or {}).get("tab_id")
-                        _provision_tab_cockpit(herdr, existing_same, (t_res.get("root_pane") or {}).get("pane_id"), cfg)
-                        task["updated_at"] = now_iso()
-                        atomic_write_json(paths.task_file(tid), task)
-                elif getattr(args, "focus", False) and existing_same.get("tab_id"):
-                    herdr.focus_tab(existing_same["tab_id"])
-            if getattr(args, "json", False):
-                print(json.dumps(existing_same, indent=2))
-            else:
-                print(f"Worktree '{repo_short}' ({existing_same['worktree_path']}) is already attached to task '{tid}'.")
-            return 0
+            ws_id = task.get("workspace_id")
+        else:
+            existing_same = None
+            used_wt_paths = collect_active_worktree_paths(paths, exclude_task_id=tid) | {
+                w["worktree_path"] for w in task.get("worktrees", []) if w.get("worktree_path")
+            }
+            wt_info = ensure_git_worktree(args.repo, branch, cfg, task_id=tid, used_wt_paths=used_wt_paths)
+            repo_short = wt_info["repo"]
 
-        used_wt_paths = {
-            w["worktree_path"] for w in task.get("worktrees", []) if w.get("worktree_path")
-        }
-        wt_info = ensure_git_worktree(args.repo, branch, cfg, task_id=tid, used_wt_paths=used_wt_paths)
-        repo_short = wt_info["repo"]
+            existing_tabs_for_repo = [w for w in task.get("worktrees", []) if w["repo"] == repo_short]
+            tab_index = len(existing_tabs_for_repo) + 1
+            tab_title = getattr(args, "label", None) or (repo_short if tab_index == 1 else f"{repo_short} #{tab_index}")
 
-        existing_tabs_for_repo = [w for w in task.get("worktrees", []) if w["repo"] == repo_short]
-        tab_index = len(existing_tabs_for_repo) + 1
-        tab_title = getattr(args, "label", None) or (repo_short if tab_index == 1 else f"{repo_short} #{tab_index}")
+            new_wt: dict[str, Any] = {
+                **wt_info,
+                "tab_title": tab_title,
+                "tab_id": None,
+                "pane_id": None,
+            }
+            task.setdefault("worktrees", []).append(new_wt)
+            task["updated_at"] = now_iso()
+            atomic_write_json(paths.task_file(tid), task)
+            ws_id = task.get("workspace_id")
 
-        new_wt: dict[str, Any] = {
-            **wt_info,
-            "tab_title": tab_title,
-            "tab_id": None,
-            "pane_id": None,
-        }
-
-        if not getattr(args, "no_herdr", False) and task.get("workspace_id"):
+    if existing_same is not None:
+        if not getattr(args, "no_herdr", False) and ws_id:
             herdr = HerdrClient(cfg)
-            t_res = herdr.create_tab(
-                task["workspace_id"],
-                new_wt["worktree_path"],
-                tab_title,
-                tid,
-                focus=bool(getattr(args, "focus", False)),
-            )
-            if t_res:
-                new_wt["tab_id"] = (t_res.get("tab") or {}).get("tab_id")
-                _provision_tab_cockpit(herdr, new_wt, (t_res.get("root_pane") or {}).get("pane_id"), cfg)
+            live_tab_ids = {t.get("tab_id") for t in herdr.list_tabs(ws_id)}
+            if not existing_same.get("tab_id") or existing_same["tab_id"] not in live_tab_ids:
+                t_res = herdr.create_tab(
+                    ws_id,
+                    existing_same["worktree_path"],
+                    existing_same.get("tab_title") or repo_short,
+                    tid,
+                    focus=bool(getattr(args, "focus", False)),
+                )
+                if t_res:
+                    existing_same["tab_id"] = (t_res.get("tab") or {}).get("tab_id")
+                    _provision_tab_cockpit(herdr, existing_same, (t_res.get("root_pane") or {}).get("pane_id"), cfg)
+                    with task_store_lock(paths):
+                        fresh = load_task(paths, tid)
+                        if fresh:
+                            for w in fresh.get("worktrees", []):
+                                if w.get("worktree_path") == existing_same["worktree_path"]:
+                                    w["tab_id"] = existing_same.get("tab_id")
+                                    w["pane_id"] = existing_same.get("pane_id")
+                                    if "cockpit_panes" in existing_same:
+                                        w["cockpit_panes"] = existing_same["cockpit_panes"]
+                            fresh["updated_at"] = now_iso()
+                            atomic_write_json(paths.task_file(tid), fresh)
+            elif getattr(args, "focus", False) and existing_same.get("tab_id"):
+                herdr.focus_tab(existing_same["tab_id"])
+        if getattr(args, "json", False):
+            print(json.dumps(existing_same, indent=2))
+        else:
+            print(f"Worktree '{repo_short}' ({existing_same['worktree_path']}) is already attached to task '{tid}'.")
+        return 0
 
-        task.setdefault("worktrees", []).append(new_wt)
-        task["updated_at"] = now_iso()
-        atomic_write_json(paths.task_file(tid), task)
+    if not getattr(args, "no_herdr", False) and ws_id:
+        herdr = HerdrClient(cfg)
+        t_res = herdr.create_tab(
+            ws_id,
+            new_wt["worktree_path"],
+            tab_title,
+            tid,
+            focus=bool(getattr(args, "focus", False)),
+        )
+        if t_res:
+            new_wt["tab_id"] = (t_res.get("tab") or {}).get("tab_id")
+            _provision_tab_cockpit(herdr, new_wt, (t_res.get("root_pane") or {}).get("pane_id"), cfg)
+            with task_store_lock(paths):
+                fresh = load_task(paths, tid)
+                if fresh:
+                    for w in fresh.get("worktrees", []):
+                        if w.get("worktree_path") == new_wt["worktree_path"]:
+                            w["tab_id"] = new_wt.get("tab_id")
+                            w["pane_id"] = new_wt.get("pane_id")
+                            if "cockpit_panes" in new_wt:
+                                w["cockpit_panes"] = new_wt["cockpit_panes"]
+                    fresh["updated_at"] = now_iso()
+                    atomic_write_json(paths.task_file(tid), fresh)
+                    task = fresh
 
     if not getattr(args, "no_herdr", False):
         HerdrClient(cfg).sync_sidebar_metadata(task)
@@ -1859,6 +2183,7 @@ def cmd_worktree_branch(args: argparse.Namespace, paths: TaskPaths, cfg: dict[st
 
     target_repo = Path(args.repo).name
     target_branch = args.branch.strip()
+    force = bool(getattr(args, "force", False))
 
     with task_store_lock(paths):
         task = load_task(paths, tid)
@@ -1874,17 +2199,7 @@ def cmd_worktree_branch(args: argparse.Namespace, paths: TaskPaths, cfg: dict[st
             print(f"Error: repo '{args.repo}' is not attached to task '{tid}'.", file=sys.stderr)
             return 1
 
-        if not getattr(args, "force", False):
-            safety = check_worktree_safety(target_wt.get("worktree_path", ""))
-            if not safety["clean"]:
-                print(
-                    f"Error: worktree for '{target_repo}' has uncommitted changes ({len(safety['dirty_files'])} files). "
-                    "Commit/stash first or pass --force.",
-                    file=sys.stderr,
-                )
-                return 1
-
-        ok, msg = switch_worktree_branch(target_wt, target_branch, cfg)
+        ok, msg = switch_worktree_branch(target_wt, target_branch, cfg, task_id=tid, force=force)
         if not ok:
             print(f"Error: {msg}", file=sys.stderr)
             return 1
@@ -1907,6 +2222,7 @@ def cmd_update(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) 
 
     messages: list[str] = []
     title_changed = False
+    force = bool(getattr(args, "force", False))
 
     with task_store_lock(paths):
         task = load_task(paths, tid)
@@ -1937,6 +2253,8 @@ def cmd_update(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) 
             old_status = task.get("status") or "in_progress"
             if norm_st != old_status:
                 task["status"] = norm_st
+                if norm_st == "archived":
+                    task["archived_at"] = now_iso()
                 messages.append(f"Updated task status: '{old_status}' -> '{norm_st}'")
                 _, auto_msgs = dispatch_automation_event(
                     "task.status_changed",
@@ -1980,16 +2298,28 @@ def cmd_update(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) 
             only_repo = task["worktrees"][0]["repo"]
             repo_branch_map[only_repo] = new_def_branch.strip()
 
+        branch_errors = False
         for repo_key, target_b in repo_branch_map.items():
             target_wt = next((w for w in task.get("worktrees", []) if w["repo"] == repo_key), None)
             if target_wt:
-                ok, msg = switch_worktree_branch(target_wt, target_b, cfg)
-                messages.append(msg if ok else f"Warning: {msg}")
+                ok, msg = switch_worktree_branch(target_wt, target_b, cfg, task_id=tid, force=force)
+                if ok:
+                    messages.append(msg)
+                else:
+                    branch_errors = True
+                    messages.append(f"Error: {msg}")
             else:
+                branch_errors = True
                 messages.append(f"Warning: repo '{repo_key}' is not attached to task '{tid}'")
 
         task["updated_at"] = now_iso()
-        atomic_write_json(paths.task_file(tid), task)
+        if task.get("status") == "archived":
+            atomic_write_json(paths.archive_file(tid), task)
+            active_f = paths.task_file(tid)
+            if active_f.exists():
+                active_f.unlink()
+        else:
+            atomic_write_json(paths.task_file(tid), task)
 
     if not getattr(args, "no_herdr", False) and task.get("workspace_id"):
         herdr = HerdrClient(cfg)
@@ -2001,8 +2331,9 @@ def cmd_update(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) 
         print(json.dumps(task, indent=2))
     else:
         for m in messages or [f"Task '{tid}' is up to date."]:
-            print(f"• {m}")
-    return 0
+            stream = sys.stderr if m.startswith("Error:") else sys.stdout
+            print(f"• {m}", file=stream)
+    return 1 if branch_errors else 0
 
 
 def cmd_sync(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) -> int:
@@ -2021,17 +2352,47 @@ def cmd_sync(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) ->
         modified = False
         # 1. Refresh GitHub PR metadata
         for r in task.get("resources", []):
-            if r.get("category") == "pull_request" and r.get("url"):
-                m = GH_PR_URL_RE.search(r["url"])
-                if m:
-                    gh_meta = fetch_github_pr_metadata(m.group(1), m.group(2), m.group(3))
-                    if gh_meta:
-                        if gh_meta.get("status") and r.get("status") != gh_meta["status"]:
-                            r["status"] = gh_meta["status"]
-                            modified = True
-                        if gh_meta.get("branch"):
-                            r.setdefault("metadata", {})["branch"] = gh_meta["branch"]
-                        messages.append(f"[github] Synced {r.get('ref')} -> [{r.get('status') or 'OPEN'}]")
+            if r.get("category") != "pull_request":
+                continue
+            meta = r.setdefault("metadata", {})
+            org: str | None = None
+            repo: str | None = None
+            num: str | None = None
+            m = GH_PR_URL_RE.search(r.get("url") or "")
+            if m:
+                org, repo, num = m.group(1), m.group(2), m.group(3)
+            else:
+                m_sh = GH_SHORT_RE.match(r.get("ref") or "")
+                if m_sh:
+                    repo = m_sh.group(2)
+                    num = m_sh.group(3)
+                    org = m_sh.group(1) or meta.get("org") or _infer_github_org_for_repo(repo, cfg)
+            if org and repo and num:
+                gh_meta = fetch_github_pr_metadata(org, repo, num)
+                if gh_meta:
+                    res_mod = False
+                    if not r.get("url") or not r["url"].startswith("http"):
+                        r["url"] = f"https://github.com/{org}/{repo}/pull/{num}"
+                        res_mod = True
+                    if gh_meta.get("status") and r.get("status") != gh_meta["status"]:
+                        r["status"] = gh_meta["status"]
+                        res_mod = True
+                    if gh_meta.get("branch") and meta.get("branch") != gh_meta["branch"]:
+                        meta["branch"] = gh_meta["branch"]
+                        res_mod = True
+                    if gh_meta.get("title") and meta.get("pr_title") != gh_meta["title"]:
+                        meta["pr_title"] = gh_meta["title"]
+                        res_mod = True
+                    if gh_meta.get("title") and (not r.get("label") or r.get("label") in (f"{repo}#{num}", f"{repo} #{num}")):
+                        r["label"] = f"{repo}#{num}: {gh_meta['title']}"
+                        res_mod = True
+                    if gh_meta.get("summary") and not r.get("summary"):
+                        r["summary"] = gh_meta["summary"]
+                        res_mod = True
+                    if res_mod:
+                        r["updated_at"] = now_iso()
+                        modified = True
+                    messages.append(f"[github] Synced {r.get('ref')} -> [{r.get('status') or 'OPEN'}]")
 
         # 2. Dispatch `task.sync` to all modular automations (e.g. jira_status_sync)
         auto_mod, auto_msgs = dispatch_automation_event("task.sync", task, paths, cfg)
@@ -2081,6 +2442,81 @@ def cmd_automations(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, A
         print(f"  events: {ev_str}")
         print(f"  path:   {a['path']}")
     return 0
+
+
+def cmd_integrations(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) -> int:
+    action = getattr(args, "integ_action", None) or "list"
+    target = getattr(args, "target", None)
+    tid = resolve_current_task_id(paths, getattr(args, "task", None), include_archived=True)
+    task = load_task(paths, tid, include_archived=True) if tid else None
+
+    if action == "list":
+        integs = discover_integrations(paths, cfg)
+        out_list = [
+            {
+                "id": i["id"],
+                "enabled": i["enabled"],
+                "description": i["description"],
+                "capabilities": i["capabilities"],
+                "path": i["path"],
+            }
+            for i in integs
+        ]
+        if getattr(args, "json", False):
+            print(json.dumps(out_list, indent=2))
+            return 0
+        if not out_list:
+            print("No modular integration providers found.")
+            return 0
+        for i in out_list:
+            st_str = "ENABLED" if i["enabled"] else "DISABLED"
+            caps_str = ", ".join(i["capabilities"])
+            print(f"• {i['id']:22} [{st_str:8}] — {i['description']}")
+            print(f"  capabilities: {caps_str}")
+            print(f"  path:         {i['path']}")
+        return 0
+
+    if action == "candidates":
+        kind = (target or "resource").strip()
+        cands = query_integration_candidates(kind, paths, cfg, task=task)
+        if getattr(args, "json", False):
+            print(json.dumps(cands, indent=2))
+            return 0
+        if not cands:
+            print(f"No candidates returned for '{kind}'.")
+            return 0
+        for c in cands:
+            print(f"{c.get('value', ''):36} | {c.get('label', '')}")
+        return 0
+
+    if action == "options":
+        field = (target or "resource.status").strip()
+        res_ctx = {
+            "category": getattr(args, "category", None),
+            "provider": getattr(args, "provider", None),
+            "ref": getattr(args, "ref", None),
+        }
+        opts = query_integration_field_options(
+            field,
+            paths,
+            cfg,
+            task=task,
+            resource=res_ctx,
+            category=getattr(args, "category", None),
+            provider=getattr(args, "provider", None),
+            repo=getattr(args, "repo", None),
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(opts, indent=2))
+            return 0
+        if not opts:
+            print(f"No field options returned for '{field}'.")
+            return 0
+        for o in opts:
+            print(f"{o.get('value', ''):28} | {o.get('label', '')}")
+        return 0
+
+    return 1
 
 
 def cmd_add(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) -> int:
@@ -2342,6 +2778,11 @@ def cmd_cleanup(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any])
             task = fresh_task
         old_status = task.get("status") or "in_progress"
         task["status"] = "archived"
+        task["workspace_id"] = None
+        for wt in task.get("worktrees", []):
+            wt["tab_id"] = None
+            wt["pane_id"] = None
+            wt.pop("cockpit_panes", None)
         task["archived_at"] = now_iso()
         task["updated_at"] = now_iso()
         _, auto_msgs = dispatch_automation_event(
@@ -2501,7 +2942,7 @@ def _select_pilot_choice_and_cmd(
     models = cfg.get("pilot_models") or DEFAULT_CONFIG["pilot_models"]
     menu_items: list[str] = []
     if include_quick:
-        menu_items.append("quick\t⚡ Quick Form (0 Tokens / 0 AIC) — Prompt for Title, Repos, Branch, Ticket")
+        menu_items.append("quick\t⚡ Interactive Task Form (0 Tokens / 0 AIC) — Field Navigator, Jira/PR Picker & Dropdowns")
     model_by_id: dict[str, dict[str, Any]] = {}
     for m in models:
         if isinstance(m, dict) and m.get("id") and m.get("label"):
@@ -2542,6 +2983,1408 @@ def _select_pilot_choice_and_cmd(
     return choice, [c_bin]
 
 
+# ---------------------------------------------------------------------------
+# Interactive Field-Navigator Forms & Integration Dropdown Pickers
+# ---------------------------------------------------------------------------
+
+KNOWN_RESOURCE_CATEGORIES: list[tuple[str, str]] = [
+    ("ticket", "🎫 ticket — Jira / Issue Tracker Ticket"),
+    ("pull_request", "🔀 pull_request — GitHub Pull Request"),
+    ("issue", "🐛 issue — GitHub / Tracker Issue"),
+    ("conversation", "💬 conversation — Slack Thread / Chat"),
+    ("alert", "🚨 alert — Grafana / Datadog / Sentry Alert"),
+    ("doc", "📄 doc — Notion / Confluence / Figma / Spec"),
+    ("custom", "🔗 custom — General Web URL / Reference"),
+]
+
+KNOWN_RESOURCE_PROVIDERS: list[tuple[str, str]] = [
+    ("jira", "🎫 jira — Atlassian Jira"),
+    ("github", "🔀 github — GitHub"),
+    ("slack", "💬 slack — Slack"),
+    ("grafana", "🚨 grafana — Grafana"),
+    ("datadog", "🚨 datadog — Datadog"),
+    ("sentry", "🚨 sentry — Sentry"),
+    ("notion", "📄 notion — Notion"),
+    ("confluence", "📄 confluence — Atlassian Confluence"),
+    ("figma", "🎨 figma — Figma"),
+    ("web", "🌐 web — Web Link"),
+    ("custom", "🔗 custom — Custom Provider"),
+]
+
+
+def prompt_inline_text(
+    label: str,
+    current_value: str = "",
+    allow_clear: bool = True,
+    hint: str = "",
+) -> str | None:
+    """
+    Prompts for a single text field. When running in an interactive terminal,
+    pre-fills `current_value` via `readline` so the user can edit in-place with
+    arrow keys and Backspace.
+    """
+    cur = str(current_value or "")
+    clear_hint = "  |  Type '-' to clear" if allow_clear and cur else ""
+    extra_hint = f"  |  {hint}" if hint else ""
+    print(f"\n--- ✏️  Edit {label} ---")
+    print(f"Press [Enter] to confirm{clear_hint}{extra_hint}  |  [Ctrl-C] Cancel")
+
+    if sys.stdin.isatty():
+        try:
+            import readline
+            readline.set_startup_hook(lambda: readline.insert_text(cur))
+        except Exception:
+            readline = None  # type: ignore[assignment]
+        try:
+            raw = input(f"{label}: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        finally:
+            if "readline" in locals() and readline is not None:
+                try:
+                    readline.set_startup_hook(None)
+                except Exception:
+                    pass
+        val = raw.strip()
+        if val == "-" and allow_clear:
+            return ""
+        return val
+
+    print(f"{label} [{cur or 'empty'}]: ", end="", flush=True)
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    val = line.strip()
+    if val == "-" and allow_clear:
+        return ""
+    if val == "":
+        return cur
+    return val
+
+
+def prompt_fzf_dropdown(
+    fzf_bin: str,
+    options: list[dict[str, Any]],
+    prompt: str,
+    header: str,
+    current_value: str = "",
+    allow_custom: bool = False,
+    allow_clear: bool = False,
+) -> str | None:
+    """
+    Interactive `fzf` dropdown for fixed or integration-supplied field options.
+    Supports `action == 'open_url'` entries (opens browser and stays in dropdown)
+    and `allow_custom=True` (via `--print-query` or 'Type custom value...').
+    """
+    cur_norm = (current_value or "").strip().lower()
+    while True:
+        rows: list[str] = []
+        by_key: dict[str, dict[str, Any]] = {}
+        for idx, opt in enumerate(options):
+            val = str(opt.get("value") or "").strip()
+            lbl = str(opt.get("label") or val).strip()
+            key = f"opt_{idx}"
+            is_cur = bool(cur_norm and val.lower() == cur_norm)
+            suffix = "  ✨ (current)" if is_cur else ""
+            rows.append(f"{key}\t{lbl}{suffix}")
+            by_key[key] = opt
+
+        if allow_custom:
+            rows.append("__custom__\t✏️  Type a custom value manually...")
+        if allow_clear and current_value:
+            rows.append("__clear__\t🗑️  Clear field (set to empty)")
+
+        cmd = [
+            fzf_bin,
+            "--ansi",
+            "--delimiter=\t",
+            "--with-nth=2",
+            f"--prompt={prompt}",
+            f"--header={header}",
+        ]
+        if allow_custom:
+            cmd.append("--print-query")
+
+        res = subprocess.run(
+            cmd,
+            input="\n".join(rows),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        out_lines = [ln for ln in res.stdout.splitlines() if ln.strip() or allow_custom]
+        if not allow_custom:
+            if res.returncode != 0 or not res.stdout.strip():
+                return None
+            chosen_key = res.stdout.strip().splitlines()[0].split("\t", 1)[0].strip()
+            query_str = ""
+        else:
+            if res.returncode not in (0, 1) or not out_lines:
+                return None
+            query_str = out_lines[0].strip() if len(out_lines) >= 1 else ""
+            chosen_line = out_lines[1].strip() if len(out_lines) >= 2 else ""
+            chosen_key = chosen_line.split("\t", 1)[0].strip() if chosen_line else ""
+            if not chosen_key:
+                return query_str if query_str else None
+
+        if chosen_key == "__clear__":
+            return ""
+        if chosen_key == "__custom__":
+            typed = prompt_inline_text(prompt.rstrip(" >"), current_value=current_value, allow_clear=allow_clear)
+            return typed
+
+        chosen_opt = by_key.get(chosen_key)
+        if not chosen_opt:
+            return query_str if (allow_custom and query_str) else None
+
+        if chosen_opt.get("action") == "open_url" and chosen_opt.get("url"):
+            open_url_target(str(chosen_opt["url"]))
+            continue
+
+        return str(chosen_opt.get("value") or "")
+
+
+def _resolve_default_jira_browse_url(cfg: dict[str, Any]) -> str:
+    raw = str(cfg.get("jira_base_url") or "").strip().rstrip("/")
+    if not raw or "your-org.atlassian.net" in raw:
+        auto_jira = (cfg.get("automations") or {}).get("jira_status_sync")
+        if isinstance(auto_jira, dict) and auto_jira.get("base_url"):
+            raw = str(auto_jira["base_url"]).strip().rstrip("/")
+    if raw.endswith("/browse"):
+        raw = raw[:-len("/browse")].rstrip("/")
+    if not raw or "your-org.atlassian.net" in raw:
+        return ""
+    return f"{raw}/jira/your-work"
+
+
+def prompt_integration_candidate(
+    fzf_bin: str,
+    kind: str,
+    paths: TaskPaths,
+    cfg: dict[str, Any],
+    prompt: str,
+    header: str,
+    current_value: str = "",
+    task: dict[str, Any] | None = None,
+    repos: list[str] | None = None,
+    allow_clear: bool = True,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """
+    Opens an `fzf` picker populated by modular integrations (`provide_candidates`)
+    for Jira tickets, GitHub PRs, or general resources.
+    Includes browser redirect rows (`🌐 Open Jira in Browser...`, `🌐 Open GitHub PRs...`)
+    and `[Ctrl-O]` to open in browser without leaving the picker!
+    """
+    self_bin = f"{shlex.quote(sys.executable)} {shlex.quote(os.path.abspath(__file__))}"
+
+    with tempfile.TemporaryDirectory(prefix="herdr_cand_") as tmp_dir:
+        preview_file = Path(tmp_dir) / "candidates.json"
+
+        while True:
+            cands = query_integration_candidates(
+                kind,
+                paths,
+                cfg,
+                task=task,
+                repos=repos,
+                current_ref=current_value,
+            )
+
+            selectable_cands = [c for c in cands if c.get("action") != "open_url"]
+            browser_cands = [c for c in cands if c.get("action") == "open_url"]
+
+            rows: list[str] = []
+            by_key: dict[str, dict[str, Any]] = {}
+            previews_by_key: dict[str, str] = {}
+
+            cur_norm = (current_value or "").strip().lower()
+            idx = 0
+            for c in selectable_cands:
+                key = f"cand_{idx}"
+                idx += 1
+                val = str(c.get("value") or "").strip()
+                lbl = str(c.get("label") or val).strip()
+                is_cur = bool(cur_norm and val.lower() == cur_norm)
+                suffix = "  ✨ (current)" if is_cur else ""
+                rows.append(f"{key}\t{lbl}{suffix}")
+                by_key[key] = c
+                previews_by_key[key] = str(c.get("preview") or f"{lbl}\n\nValue: {val}")
+
+            for c in browser_cands:
+                key = f"open_{idx}"
+                idx += 1
+                lbl = str(c.get("label") or c.get("url") or "Open in Browser").strip()
+                rows.append(f"{key}\t{lbl}")
+                by_key[key] = c
+                previews_by_key[key] = str(c.get("preview") or f"🌐 Open in Browser:\n{c.get('url')}")
+
+            rows.append("__manual__\t✏️  Enter Key, Shorthand (PROJ-123 / repo#42), or URL manually...")
+            previews_by_key["__manual__"] = (
+                "✏️  Manual Input\n\n"
+                "Select this option (or type directly into the fzf search bar and press [Enter]) "
+                "to enter any Jira ticket key (PROJ-123), GitHub PR shorthand (org/repo#42), "
+                "Slack thread URL, Alert URL, or Doc URL."
+            )
+
+            if allow_clear and current_value:
+                rows.append("__clear__\t🗑️  Clear value (unlink / set to empty)")
+                previews_by_key["__clear__"] = f"🗑️  Clear current value ({current_value})"
+
+            preview_file.write_text(json.dumps(previews_by_key, ensure_ascii=False), encoding="utf-8")
+            q_pfile = shlex.quote(str(preview_file))
+
+            cmd = [
+                fzf_bin,
+                "--ansi",
+                "--delimiter=\t",
+                "--with-nth=2",
+                "--print-query",
+                "--expect=ctrl-o",
+                f"--prompt={prompt}",
+                f"--header={header}",
+                "--preview",
+                f"{self_bin} _popup-action preview-candidate {q_pfile} {{1}}",
+                "--preview-window",
+                "down:55%:wrap",
+            ]
+
+            res = subprocess.run(
+                cmd,
+                input="\n".join(rows),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            raw_lines = res.stdout.splitlines()
+            if res.returncode not in (0, 1) or not raw_lines:
+                return None, None
+
+            query_str = raw_lines[0].strip() if len(raw_lines) >= 1 else ""
+            expect_key = raw_lines[1].strip() if len(raw_lines) >= 2 else ""
+            selected_line = raw_lines[2].strip() if len(raw_lines) >= 3 else ""
+            chosen_key = selected_line.split("\t", 1)[0].strip() if selected_line else ""
+
+            if expect_key == "ctrl-o":
+                chosen_item = by_key.get(chosen_key)
+                target_open_url = ""
+                if chosen_item:
+                    target_open_url = str(
+                        chosen_item.get("url")
+                        or (chosen_item.get("resource_patch") or {}).get("url")
+                        or ""
+                    )
+                if not target_open_url and browser_cands:
+                    target_open_url = str(browser_cands[0].get("url") or "")
+                if not target_open_url:
+                    target_open_url = _resolve_default_jira_browse_url(cfg)
+                if target_open_url:
+                    open_url_target(target_open_url)
+                continue
+
+            if not chosen_key:
+                if query_str:
+                    return query_str, None
+                return None, None
+
+            if chosen_key == "__clear__":
+                return "", None
+
+            if chosen_key == "__manual__":
+                default_init = query_str if query_str else current_value
+                typed = prompt_inline_text(
+                    prompt.rstrip(" >"),
+                    current_value=default_init,
+                    allow_clear=allow_clear,
+                    hint="e.g. PROJ-123, org/repo#42, or https://...",
+                )
+                return typed, None
+
+            chosen_item = by_key.get(chosen_key)
+            if not chosen_item:
+                return (query_str, None) if query_str else (None, None)
+
+            if chosen_item.get("action") == "open_url" and chosen_item.get("url"):
+                open_url_target(str(chosen_item["url"]))
+                continue
+
+            val = str(chosen_item.get("value") or "").strip()
+            patch = chosen_item.get("resource_patch") if isinstance(chosen_item.get("resource_patch"), dict) else None
+            return val, patch
+
+
+def apply_resource_target_to_draft(
+    draft: dict[str, Any],
+    raw_target: str,
+    cfg: dict[str, Any],
+    paths: TaskPaths,
+    task: dict[str, Any] | None = None,
+    candidate_patch: dict[str, Any] | None = None,
+) -> list[str]:
+    """
+    Classifies and enriches `raw_target` (via GitHub PR metadata and modular integrations
+    such as Jira REST API v3) and updates the resource `draft` in-place.
+    """
+    clean = raw_target.strip()
+    if not clean:
+        draft["ref"] = ""
+        return []
+
+    old_ref = draft.get("ref") or ""
+    target_changed = clean != old_ref
+
+    classified = classify_resource(clean, cfg, fetch_remote=True)
+    msgs = enrich_draft_resource_via_integrations(classified, paths, cfg, task=task)
+
+    if isinstance(candidate_patch, dict):
+        for k in ("ref", "url", "category", "provider", "label", "status", "summary"):
+            if candidate_patch.get(k):
+                classified[k] = candidate_patch[k]
+        if isinstance(candidate_patch.get("metadata"), dict):
+            classified.setdefault("metadata", {}).update(candidate_patch["metadata"])
+
+    draft["ref"] = classified.get("ref") or clean
+    draft["url"] = classified.get("url") or clean
+    draft["category"] = classified.get("category") or draft.get("category") or "custom"
+    draft["provider"] = classified.get("provider") or draft.get("provider") or "custom"
+    draft.setdefault("metadata", {}).update(classified.get("metadata") or {})
+
+    if target_changed or not draft.get("label") or draft.get("label") == old_ref:
+        draft["label"] = classified.get("label") or draft["ref"]
+    if (target_changed or not draft.get("status")) and classified.get("status"):
+        draft["status"] = classified["status"]
+    if (target_changed or not draft.get("summary")) and classified.get("summary"):
+        draft["summary"] = classified["summary"]
+
+    draft["enrichment_messages"] = msgs
+    return msgs
+
+
+def format_form_preview(state: dict[str, Any], selected_key: str, color: bool = True) -> str:
+    c_bold = "\033[1m" if color else ""
+    c_cyan = "\033[36m" if color else ""
+    c_green = "\033[32m" if color else ""
+    c_yellow = "\033[33m" if color else ""
+    c_magenta = "\033[35m" if color else ""
+    c_dim = "\033[2m" if color else ""
+    c_reset = "\033[0m" if color else ""
+
+    form_type = state.get("form_type") or "task"
+    mode = state.get("mode") or "edit"
+    draft = state.get("draft") or {}
+    orig = state.get("original") or {}
+
+    field_hints: dict[str, str] = {
+        "target": "🎯 Press [Enter] to pick from My Jira Tickets, Open GitHub PRs, open Jira/GitHub in Browser, or type a key/URL.",
+        "label": "🏷️  Press [Enter] to edit the display label in-place (pre-filled with current value).",
+        "category": "📂 Press [Enter] to open the Category dropdown (ticket, pull_request, issue, conversation, alert, doc, custom).",
+        "provider": "🔌 Press [Enter] to open the Provider dropdown (jira, github, slack, grafana, notion, ...) or type custom.",
+        "status": "🚦 Press [Enter] to open the Status dropdown (populated from modular integrations e.g. Jira transitions / GitHub states).",
+        "summary": "📝 Press [Enter] to edit the technical summary in-place (avoids redundant AI/MCP lookups).",
+        "url": "🔗 Press [Enter] to edit the target URL in-place (or press [Ctrl-O] to open it in browser).",
+        "sync_branch": "🌿 Press [Enter] to toggle switching the attached repo worktree to match this PR's branch on save.",
+        "open_browser": "🌐 Press [Enter] or [Ctrl-O] to open the resource or Jira/GitHub dashboard in your browser.",
+        "title": "📌 Press [Enter] to edit the task title in-place (also updates the Herdr workspace label).",
+        "jira_ticket": "🎫 Press [Enter] to list your assigned Jira tickets, redirect to Jira in Browser, or enter a ticket key (auto-fills Title & ID!).",
+        "pr_links": "🔀 Press [Enter] to pick from open GitHub PRs (`gh pr list`), open GitHub in Browser, or add a PR/resource link.",
+        "repos": "📦 Press [Enter] to open the multi-select Repository picker (`[Tab]` to toggle multiple repos from repo_roots).",
+        "default_branch": "🌿 Press [Enter] to pick a Git branch from local/remote refs or type a custom branch name.",
+        "brief": "📝 Press [Enter] to edit the shared multi-repo technical brief in-place.",
+        "id": "🆔 Press [Enter] to customize the task ID slug (auto-generated from Jira Ticket + Title by default).",
+        "open_jira": "🌐 Press [Enter] or [Ctrl-O] to open Jira in your browser to check or search your tickets.",
+        "_save_": "✅ Press [Enter] (or [Ctrl-S] from any row) to validate and save all changes.",
+        "_cancel_": "❌ Press [Enter] (or [Esc]) to discard changes and return.",
+    }
+    if selected_key.startswith("repo_branch:"):
+        r_name = selected_key.split(":", 1)[1]
+        hint_text = f"🌿 Press [Enter] to open the Git branch dropdown (local & remote branches) for repository '{r_name}'."
+    else:
+        hint_text = field_hints.get(selected_key, "Select any field and press [Enter] to edit it, or [Ctrl-S] to save.")
+
+    def _diff_badge(key: str) -> str:
+        if mode != "edit":
+            return ""
+        if draft.get(key) != orig.get(key):
+            return f"  {c_yellow}✨ (modified){c_reset}"
+        return ""
+
+    lines: list[str] = [
+        f"{c_bold}{c_magenta}💡 Selected Field:{c_reset} {hint_text}",
+        f"{c_dim}────────────────────────────────────────────────────────────────────────────{c_reset}",
+    ]
+
+    if form_type == "resource":
+        cat = draft.get("category") or "custom"
+        icon = RESOURCE_CATEGORY_ICONS.get(cat, "🔗")
+        title_str = "➕ New Resource Draft" if mode == "add" else f"✏️  Editing Resource [{orig.get('ref') or draft.get('ref')}]"
+        lines.extend([
+            f"{c_bold}{c_cyan}{title_str}  (Task: {state.get('task_id', '')}){c_reset}",
+            "",
+            f"  {c_bold}Target / Ref:{c_reset}   {draft.get('ref') or f'{c_dim}(not set — select Target row to pick Jira/PR/URL){c_reset}'}{_diff_badge('ref')}",
+            f"  {c_bold}Display Label:{c_reset}  {draft.get('label') or f'{c_dim}(auto){c_reset}'}{_diff_badge('label')}",
+            f"  {c_bold}Category:{c_reset}       {icon} {cat}{_diff_badge('category')}",
+            f"  {c_bold}Provider:{c_reset}       {draft.get('provider') or 'custom'}{_diff_badge('provider')}",
+            f"  {c_bold}Status Badge:{c_reset}   {c_yellow}{draft.get('status') or '(none)'}{c_reset}{_diff_badge('status')}",
+            f"  {c_bold}URL:{c_reset}            {c_green}{draft.get('url') or '(none)'}{c_reset}{_diff_badge('url')}",
+            f"  {c_bold}Summary:{c_reset}        {draft.get('summary') or f'{c_dim}(none){c_reset}'}{_diff_badge('summary')}",
+        ])
+        meta = draft.get("metadata") or {}
+        if meta.get("branch") or meta.get("repo"):
+            lines.append(
+                f"  {c_bold}PR Metadata:{c_reset}    repo={meta.get('repo', '-')}  branch={c_yellow}{meta.get('branch', '-')}{c_reset}"
+            )
+    else:
+        st = (draft.get("status") or "in_progress").lower()
+        st_icon = TASK_STATUS_ICONS.get(st, "🚧")
+        hdr = "⚡ New Task Draft" if mode == "create" else f"✏️  Editing Task [{state.get('task_id', '')}]"
+        repos_list = draft.get("repos") or []
+        repo_branches = draft.get("repo_branches") or {}
+        pr_links = draft.get("pr_links") or []
+
+        lines.extend([
+            f"{c_bold}{c_cyan}{hdr}{c_reset}",
+            "",
+            f"  {c_bold}Task ID:{c_reset}        {draft.get('id') or '(auto)'}",
+            f"  {c_bold}Title:{c_reset}          {draft.get('title') or f'{c_dim}Untitled Task{c_reset}'}{_diff_badge('title')}",
+            f"  {c_bold}Status:{c_reset}         {st_icon} {st.upper()}{_diff_badge('status')}",
+            f"  {c_bold}Jira Ticket:{c_reset}    {draft.get('jira_ticket_display') or draft.get('jira_ticket') or f'{c_dim}(none){c_reset}'}{_diff_badge('jira_ticket')}",
+            f"  {c_bold}PR / Links:{c_reset}     {', '.join(pr_links) if pr_links else f'{c_dim}(none){c_reset}'}{_diff_badge('pr_links')}",
+            f"  {c_bold}Repositories:{c_reset}   {', '.join(repos_list) if repos_list else f'{c_dim}(none selected){c_reset}'}{_diff_badge('repos')}",
+            f"  {c_bold}Default Branch:{c_reset} {c_yellow}{draft.get('default_branch') or '(auto)'}{c_reset}{_diff_badge('default_branch')}",
+        ])
+        for r_name in repos_list:
+            rb = repo_branches.get(r_name) or draft.get("default_branch") or f"feat/{draft.get('id') or 'task'}"
+            orig_rb = (orig.get("repo_branches") or {}).get(r_name)
+            mod_tag = f"  {c_yellow}✨ (modified){c_reset}" if (mode == "edit" and orig_rb and rb != orig_rb) else ""
+            lines.append(f"    ↳ {c_bold}{r_name}{c_reset}: {c_yellow}{rb}{c_reset}{mod_tag}")
+        lines.append(f"  {c_bold}Brief:{c_reset}          {draft.get('brief') or f'{c_dim}(none){c_reset}'}{_diff_badge('brief')}")
+
+    enr = draft.get("enrichment_messages") or []
+    if enr:
+        lines.extend(["", f"{c_bold}{c_green}🔌 Integration Enrichment:{c_reset}"])
+        for m in enr[-4:]:
+            lines.append(f"  • {m}")
+
+    lines.extend([
+        "",
+        f"{c_dim}Shortcuts: [Enter] Edit Selected Field  |  [Ctrl-S] Save & Apply  |  [Ctrl-O] Open in Browser  |  [Esc] Cancel{c_reset}",
+    ])
+    return "\n".join(lines)
+
+
+def _format_ResourceForm_rows(draft: dict[str, Any], mode: str) -> list[str]:
+    ref = draft.get("ref") or ""
+    lbl = draft.get("label") or ""
+    cat = draft.get("category") or "custom"
+    cat_icon = RESOURCE_CATEGORY_ICONS.get(cat, "🔗")
+    prov = draft.get("provider") or "custom"
+    st = draft.get("status") or ""
+    summary = (draft.get("summary") or "").replace("\t", " ").replace("\n", " ")
+    url = draft.get("url") or ""
+    meta = draft.get("metadata") or {}
+
+    rows = [
+        f"target\t🎯 Target / Reference   : {ref or '(click to pick Jira Ticket, GitHub PR, or enter URL...)'}",
+        f"label\t🏷️  Display Label        : {lbl or '(auto)'}",
+        f"category\t📂 Category             : {cat_icon} {cat}  [dropdown]",
+        f"provider\t🔌 Provider             : {prov}  [dropdown]",
+        f"status\t🚦 Status Badge         : {st or '(none)'}  [dropdown]",
+        f"summary\t📝 Summary              : {(summary[:64] + '…') if len(summary) > 64 else (summary or '(none)')}",
+        f"url\t🔗 URL                  : {url or '(none)'}",
+    ]
+    if cat == "pull_request" or meta.get("branch"):
+        sync_str = "Yes" if draft.get("sync_branch") else "No"
+        br_hint = f" ({meta.get('repo', 'repo')} -> {meta['branch']})" if meta.get("branch") else ""
+        rows.append(f"sync_branch\t🌿 Sync Worktree Branch : {sync_str}{br_hint}  [toggle]")
+
+    open_lbl = url if url.startswith(("http://", "https://")) else "Open Jira / GitHub Dashboard in Browser"
+    rows.append(f"open_browser\t🌐 Open in Browser      : {open_lbl}")
+    save_txt = "✅ Save New Resource" if mode == "add" else "✅ Save Resource Changes"
+    rows.append(f"_save_\t{save_txt}  (or press [Ctrl-S])")
+    rows.append("_cancel_\t❌ Cancel  (or press [Esc])")
+    return rows
+
+
+def interactive_resource_form(
+    tid: str,
+    paths: TaskPaths,
+    cfg: dict[str, Any],
+    resource_id: str | None = None,
+    initial_target: str | None = None,
+    no_herdr: bool = False,
+) -> int:
+    """
+    Interactive field-navigator form for adding or editing a resource on task `tid`.
+    Displays all resource fields at once in `fzf`, provides dropdowns for Category,
+    Provider, Status Badge, and Jira/GitHub candidates, and supports browser redirection.
+    """
+    task = load_task(paths, tid)
+    if not task:
+        print(f"Error: task '{tid}' not found.", file=sys.stderr)
+        return 1
+
+    target_res = None
+    if resource_id and resource_id not in ("_add_", "_pilot_"):
+        target_res = next(
+            (r for r in task.get("resources", []) if r.get("id") == resource_id or r.get("ref") == resource_id),
+            None,
+        )
+
+    mode = "edit" if target_res else "add"
+    if target_res:
+        draft: dict[str, Any] = {
+            "id": target_res.get("id"),
+            "ref": target_res.get("ref") or "",
+            "label": target_res.get("label") or "",
+            "category": target_res.get("category") or "custom",
+            "provider": target_res.get("provider") or "custom",
+            "status": target_res.get("status") or "",
+            "summary": target_res.get("summary") or "",
+            "url": target_res.get("url") or "",
+            "metadata": json.loads(json.dumps(target_res.get("metadata") or {})),
+            "sync_branch": False,
+            "enrichment_messages": [],
+        }
+    else:
+        draft = {
+            "id": None,
+            "ref": "",
+            "label": "",
+            "category": "ticket",
+            "provider": "jira",
+            "status": "",
+            "summary": "",
+            "url": "",
+            "metadata": {},
+            "sync_branch": False,
+            "enrichment_messages": [],
+        }
+        if initial_target:
+            apply_resource_target_to_draft(draft, initial_target, cfg, paths, task=task)
+
+    original = json.loads(json.dumps(draft))
+    fzf_bin = resolve_bin("fzf", cfg, "fzf_bin")
+    self_bin = f"{shlex.quote(sys.executable)} {shlex.quote(os.path.abspath(__file__))}"
+
+    with tempfile.TemporaryDirectory(prefix="herdr_res_form_") as tmp_dir:
+        state_file = Path(tmp_dir) / "form_state.json"
+
+        while True:
+            task = load_task(paths, tid) or task
+            state_payload = {
+                "form_type": "resource",
+                "mode": mode,
+                "task_id": tid,
+                "draft": draft,
+                "original": original,
+            }
+            state_file.write_text(json.dumps(state_payload, ensure_ascii=False), encoding="utf-8")
+            q_sfile = shlex.quote(str(state_file))
+
+            rows = _format_ResourceForm_rows(draft, mode)
+            title_hdr = (
+                f"Add Resource to '{tid}'  |  [Enter] Edit Field  [Ctrl-S] Save  [Ctrl-O] Browser  [Esc] Cancel"
+                if mode == "add"
+                else f"Edit Resource [{draft.get('ref')}]  |  [Enter] Edit Field  [Ctrl-S] Save  [Ctrl-O] Browser  [Esc] Cancel"
+            )
+
+            cmd = [
+                fzf_bin,
+                "--ansi",
+                "--delimiter=\t",
+                "--with-nth=2",
+                "--expect=ctrl-s,ctrl-o",
+                "--header",
+                title_hdr,
+                "--prompt",
+                f"{'Add' if mode == 'add' else 'Edit'} Resource ({tid}) > ",
+                "--preview",
+                f"{self_bin} _popup-action preview-form {q_sfile} {{1}}",
+                "--preview-window",
+                "down:58%:wrap",
+            ]
+
+            res = subprocess.run(cmd, input="\n".join(rows), capture_output=True, text=True, check=False)
+            if res.returncode != 0 or not res.stdout.strip():
+                return 0
+
+            out_lines = res.stdout.splitlines()
+            expect_key = out_lines[0].strip() if len(out_lines) >= 1 else ""
+            sel_line = out_lines[1].strip() if len(out_lines) >= 2 else ""
+            field_key = sel_line.split("\t", 1)[0].strip() if sel_line else ""
+
+            if expect_key == "ctrl-o" or field_key == "open_browser":
+                open_url = draft.get("url") or ""
+                if not open_url.startswith(("http://", "https://", "slack://")):
+                    open_url = _resolve_default_jira_browse_url(cfg) or "https://github.com/pulls"
+                open_url_target(open_url)
+                continue
+
+            if expect_key == "ctrl-s" or field_key == "_save_":
+                if not (draft.get("ref") or draft.get("url")):
+                    # Prompt for Target if user hit Save before picking one
+                    chosen_val, cand_patch = prompt_integration_candidate(
+                        fzf_bin,
+                        "resource",
+                        paths,
+                        cfg,
+                        prompt="Select Ticket, PR, or Enter URL > ",
+                        header="[Enter] Select or Type Key/URL  |  [Ctrl-O] Open in Browser  |  [Esc] Cancel",
+                        current_value="",
+                        task=task,
+                        allow_clear=False,
+                    )
+                    if not chosen_val:
+                        continue
+                    apply_resource_target_to_draft(draft, chosen_val, cfg, paths, task=task, candidate_patch=cand_patch)
+
+                if mode == "edit" and target_res:
+                    with task_store_lock(paths):
+                        task_fresh = load_task(paths, tid)
+                        if not task_fresh:
+                            return 1
+                        for r in task_fresh.get("resources", []):
+                            if r.get("id") == target_res.get("id"):
+                                r["ref"] = draft["ref"] or r.get("ref") or ""
+                                r["label"] = draft["label"]
+                                r["category"] = draft["category"] or "custom"
+                                r["provider"] = draft["provider"] or "custom"
+                                r["status"] = draft["status"] or None
+                                r["summary"] = draft["summary"] or None
+                                r["url"] = draft["url"] or ""
+                                if draft.get("metadata"):
+                                    r.setdefault("metadata", {}).update(draft["metadata"])
+                                r["updated_at"] = now_iso()
+                                break
+                        task_fresh["updated_at"] = now_iso()
+                        atomic_write_json(paths.task_file(tid), task_fresh)
+                    if not no_herdr:
+                        HerdrClient(cfg).sync_sidebar_metadata(task_fresh)
+                    return 0
+
+                target_arg = draft.get("url") if (draft.get("url") or "").startswith(("http://", "https://", "slack://")) and draft.get("category") != "ticket" else (draft.get("ref") or draft.get("url") or "")
+                return cmd_link(
+                    argparse.Namespace(
+                        target=target_arg,
+                        task=tid,
+                        label=draft.get("label") or None,
+                        status=draft.get("status") or None,
+                        summary=draft.get("summary") or None,
+                        category=draft.get("category") or None,
+                        provider=draft.get("provider") or None,
+                        added_by=None,
+                        metadata=None,
+                        sync_branch=bool(draft.get("sync_branch")),
+                        no_herdr=no_herdr,
+                        json=False,
+                    ),
+                    paths,
+                    cfg,
+                )
+
+            if field_key == "_cancel_" or not field_key:
+                return 0
+
+            if field_key == "target":
+                chosen_val, cand_patch = prompt_integration_candidate(
+                    fzf_bin,
+                    "resource",
+                    paths,
+                    cfg,
+                    prompt="Target (Jira Ticket, GitHub PR, or URL) > ",
+                    header="[Enter] Pick Ticket/PR or Type Key/URL  |  [Ctrl-O] Open in Browser  |  [Esc] Back",
+                    current_value=draft.get("ref") or "",
+                    task=task,
+                    allow_clear=False,
+                )
+                if chosen_val is not None and chosen_val != "":
+                    apply_resource_target_to_draft(draft, chosen_val, cfg, paths, task=task, candidate_patch=cand_patch)
+
+            elif field_key == "label":
+                new_lbl = prompt_inline_text("Display Label", current_value=draft.get("label") or "", allow_clear=True)
+                if new_lbl is not None:
+                    draft["label"] = new_lbl
+
+            elif field_key == "category":
+                cat_opts = [{"value": k, "label": lbl} for k, lbl in KNOWN_RESOURCE_CATEGORIES]
+                chosen_cat = prompt_fzf_dropdown(
+                    fzf_bin,
+                    cat_opts,
+                    prompt="Resource Category > ",
+                    header="Select resource category ([Esc] Cancel):",
+                    current_value=draft.get("category") or "custom",
+                    allow_custom=False,
+                )
+                if chosen_cat:
+                    draft["category"] = chosen_cat
+                    if chosen_cat == "ticket" and draft.get("provider") == "custom":
+                        draft["provider"] = "jira"
+                    elif chosen_cat in ("pull_request", "issue") and draft.get("provider") == "custom":
+                        draft["provider"] = "github"
+
+            elif field_key == "provider":
+                prov_opts = [{"value": k, "label": lbl} for k, lbl in KNOWN_RESOURCE_PROVIDERS]
+                chosen_prov = prompt_fzf_dropdown(
+                    fzf_bin,
+                    prov_opts,
+                    prompt="Resource Provider > ",
+                    header="Select provider or type a custom provider name ([Enter] Confirm, [Esc] Cancel):",
+                    current_value=draft.get("provider") or "custom",
+                    allow_custom=True,
+                )
+                if chosen_prov is not None and chosen_prov != "":
+                    draft["provider"] = chosen_prov
+
+            elif field_key == "status":
+                status_opts = query_integration_field_options(
+                    "resource.status",
+                    paths,
+                    cfg,
+                    task=task,
+                    resource=draft,
+                    category=draft.get("category"),
+                    provider=draft.get("provider"),
+                )
+                chosen_st = prompt_fzf_dropdown(
+                    fzf_bin,
+                    status_opts,
+                    prompt=f"Status Badge ({draft.get('provider') or draft.get('category')}) > ",
+                    header="Select predefined status from integration or type custom status ([Enter] Confirm, [Esc] Cancel):",
+                    current_value=draft.get("status") or "",
+                    allow_custom=True,
+                    allow_clear=True,
+                )
+                if chosen_st is not None:
+                    draft["status"] = chosen_st
+
+            elif field_key == "summary":
+                new_sum = prompt_inline_text("Resource Summary", current_value=draft.get("summary") or "", allow_clear=True)
+                if new_sum is not None:
+                    draft["summary"] = new_sum
+
+            elif field_key == "url":
+                new_url = prompt_inline_text("Resource URL", current_value=draft.get("url") or "", allow_clear=True)
+                if new_url is not None:
+                    draft["url"] = new_url
+
+            elif field_key == "sync_branch":
+                draft["sync_branch"] = not bool(draft.get("sync_branch"))
+
+
+def _recompute_task_draft_id_and_branch(draft: dict[str, Any], mode: str) -> None:
+    if mode != "create":
+        return
+    jk = (draft.get("jira_ticket") or "").strip()
+    title = (draft.get("title") or "").strip()
+    if not draft.get("custom_id"):
+        if jk and title and title != "Untitled Task":
+            clean_title = title[len(jk):].strip(" -:") if title.upper().startswith(jk.upper()) else title
+            draft["id"] = slugify(f"{jk}-{slugify(clean_title, 24)}", 48)
+        elif jk:
+            draft["id"] = slugify(jk, 48)
+        elif title and title != "Untitled Task":
+            draft["id"] = slugify(title, 36)
+        else:
+            draft["id"] = ""
+
+    if not draft.get("custom_branch"):
+        comp_id = draft.get("id") or "new-task"
+        draft["default_branch"] = f"feat/{comp_id}" if jk else comp_id
+
+
+def _format_task_form_rows(draft: dict[str, Any], mode: str) -> list[str]:
+    title = draft.get("title") or ""
+    st = (draft.get("status") or "in_progress").lower()
+    st_icon = TASK_STATUS_ICONS.get(st, "🚧")
+    jk_disp = draft.get("jira_ticket_display") or draft.get("jira_ticket") or ""
+    pr_links = draft.get("pr_links") or []
+    repos = draft.get("repos") or []
+    def_branch = draft.get("default_branch") or ""
+    repo_branches = draft.get("repo_branches") or {}
+    brief = (draft.get("brief") or "").replace("\t", " ").replace("\n", " ")
+
+    rows = [
+        f"title\t📌 Task Title           : {title or '(click to enter title — or pick Jira Ticket below to auto-fill)'}",
+        f"status\t🚦 Task Status          : {st_icon} {st.upper()}  [dropdown]",
+        f"jira_ticket\t🎫 Jira Ticket          : {jk_disp or '(pick from My Jira Tickets / Open Jira in Browser...)'}  [picker]",
+        f"pr_links\t🔀 GitHub PR / Links    : {', '.join(pr_links) if pr_links else '(pick from Open GitHub PRs / add URL...)'}  [picker]",
+        f"repos\t📦 Repositories         : {', '.join(repos) if repos else '(none — click to multi-select repos)'}  [multi-select]",
+        f"default_branch\t🌿 Default Branch       : {def_branch or '(auto)'}  [dropdown]",
+    ]
+    for r_name in repos:
+        rb = repo_branches.get(r_name) or def_branch or f"feat/{draft.get('id') or 'task'}"
+        rows.append(f"repo_branch:{r_name}\t  ↳ 🌿 Branch [{r_name}] : {rb}  [branch dropdown]")
+
+    rows.append(f"brief\t📝 Technical Brief      : {(brief[:64] + '…') if len(brief) > 64 else (brief or '(none)')}")
+    if mode == "create":
+        tid_val = draft.get("id") or "(auto-generated from Ticket + Title)"
+        rows.append(f"id\t🆔 Task ID              : {tid_val}")
+
+    rows.append("open_jira\t🌐 Open Jira in Browser : Check / search your assigned tickets in Jira")
+    save_label = "✅ Create Task & Provision Workspace" if mode == "create" else "✅ Save Task Changes"
+    rows.append(f"_save_\t{save_label}  (or press [Ctrl-S])")
+    rows.append("_cancel_\t❌ Cancel  (or press [Esc])")
+    return rows
+
+
+def interactive_task_form(
+    paths: TaskPaths,
+    cfg: dict[str, Any],
+    task_id: str | None = None,
+    initial_args: argparse.Namespace | None = None,
+    no_herdr: bool = False,
+) -> int:
+    """
+    Interactive field-navigator form for creating a new task (`task_id=None`)
+    or editing an existing task (`task_id='<id>'`).
+    Lets the user navigate to any field, open `fzf` dropdowns for Status, Repositories,
+    Git Branches, Jira Tickets (with live Jira issue search & browser redirect), and GitHub PRs.
+    """
+    existing_task = load_task(paths, task_id) if task_id else None
+    if task_id and not existing_task:
+        print(f"Error: task '{task_id}' not found.", file=sys.stderr)
+        return 1
+
+    mode = "edit" if existing_task else "create"
+    if existing_task:
+        existing_tickets = [
+            r for r in existing_task.get("resources", []) if r.get("category") == "ticket"
+        ]
+        first_tk = existing_tickets[0] if existing_tickets else None
+        existing_prs = [
+            r.get("ref") or r.get("url") or ""
+            for r in existing_task.get("resources", [])
+            if r.get("category") != "ticket" and (r.get("ref") or r.get("url"))
+        ]
+        wts = existing_task.get("worktrees") or []
+        repos_init = [w["repo"] for w in wts if w.get("repo")]
+        rb_init = {w["repo"]: w.get("branch") or "" for w in wts if w.get("repo")}
+
+        draft: dict[str, Any] = {
+            "id": existing_task["id"],
+            "title": existing_task.get("title") or "",
+            "status": existing_task.get("status") or "in_progress",
+            "jira_ticket": (first_tk.get("ref") if first_tk else "") or "",
+            "jira_ticket_display": (first_tk.get("label") if first_tk else "") or "",
+            "pr_links": existing_prs,
+            "repos": repos_init,
+            "default_branch": existing_task.get("default_branch") or "",
+            "repo_branches": rb_init,
+            "brief": existing_task.get("brief") or "",
+            "custom_id": True,
+            "custom_branch": True,
+            "enrichment_messages": [],
+        }
+    else:
+        init_repos: list[str] = []
+        if initial_args and getattr(initial_args, "repos", None):
+            init_repos.extend([r.strip() for r in initial_args.repos.split(",") if r.strip()])
+        if initial_args and getattr(initial_args, "repo_list", None):
+            for rl in initial_args.repo_list:
+                init_repos.extend([r.strip() for r in rl.split(",") if r.strip() and r.strip() not in init_repos])
+
+        init_links = list(getattr(initial_args, "link", None) or []) if initial_args else []
+        init_id = getattr(initial_args, "id", None) if initial_args else None
+        init_branch = getattr(initial_args, "branch", None) if initial_args else None
+
+        draft = {
+            "id": init_id or "",
+            "title": (getattr(initial_args, "title", None) if initial_args else None) or "",
+            "status": (getattr(initial_args, "task_status", None) if initial_args else None) or "in_progress",
+            "jira_ticket": "",
+            "jira_ticket_display": "",
+            "pr_links": init_links,
+            "repos": init_repos,
+            "default_branch": init_branch or "",
+            "repo_branches": {},
+            "brief": (getattr(initial_args, "brief", None) if initial_args else None) or "",
+            "custom_id": bool(init_id),
+            "custom_branch": bool(init_branch),
+            "enrichment_messages": [],
+        }
+        _recompute_task_draft_id_and_branch(draft, mode)
+
+    original = json.loads(json.dumps(draft))
+    fzf_bin = resolve_bin("fzf", cfg, "fzf_bin")
+    self_bin = f"{shlex.quote(sys.executable)} {shlex.quote(os.path.abspath(__file__))}"
+
+    with tempfile.TemporaryDirectory(prefix="herdr_task_form_") as tmp_dir:
+        state_file = Path(tmp_dir) / "form_state.json"
+
+        while True:
+            state_payload = {
+                "form_type": "task",
+                "mode": mode,
+                "task_id": task_id or draft.get("id") or "new",
+                "draft": draft,
+                "original": original,
+            }
+            state_file.write_text(json.dumps(state_payload, ensure_ascii=False), encoding="utf-8")
+            q_sfile = shlex.quote(str(state_file))
+
+            rows = _format_task_form_rows(draft, mode)
+            hdr = (
+                "⚡ Create New Task  |  [Enter] Edit Field  [Ctrl-S] Create Task  [Ctrl-O] Open Jira  [Esc] Cancel"
+                if mode == "create"
+                else f"✏️  Edit Task '{task_id}'  |  [Enter] Edit Field  [Ctrl-S] Save Changes  [Ctrl-O] Open Jira  [Esc] Cancel"
+            )
+
+            cmd = [
+                fzf_bin,
+                "--ansi",
+                "--delimiter=\t",
+                "--with-nth=2",
+                "--expect=ctrl-s,ctrl-o",
+                "--header",
+                hdr,
+                "--prompt",
+                f"{'Create Task' if mode == 'create' else f'Edit Task ({task_id})'} > ",
+                "--preview",
+                f"{self_bin} _popup-action preview-form {q_sfile} {{1}}",
+                "--preview-window",
+                "down:58%:wrap",
+            ]
+
+            res = subprocess.run(cmd, input="\n".join(rows), capture_output=True, text=True, check=False)
+            if res.returncode != 0 or not res.stdout.strip():
+                return 0
+
+            out_lines = res.stdout.splitlines()
+            expect_key = out_lines[0].strip() if len(out_lines) >= 1 else ""
+            sel_line = out_lines[1].strip() if len(out_lines) >= 2 else ""
+            field_key = sel_line.split("\t", 1)[0].strip() if sel_line else ""
+
+            if expect_key == "ctrl-o" or field_key == "open_jira":
+                jk = (draft.get("jira_ticket") or "").strip()
+                base_browse = str(cfg.get("jira_base_url") or "").strip().rstrip("/")
+                if jk and base_browse and "your-org.atlassian.net" not in base_browse:
+                    if not base_browse.endswith("/browse"):
+                        base_browse = f"{base_browse}/browse"
+                    open_url_target(f"{base_browse}/{jk}")
+                else:
+                    default_jira = _resolve_default_jira_browse_url(cfg)
+                    if default_jira:
+                        open_url_target(default_jira)
+                continue
+
+            if expect_key == "ctrl-s" or field_key == "_save_":
+                return _submit_interactive_task_form(draft, original, mode, task_id, paths, cfg, no_herdr=no_herdr)
+
+            if field_key == "_cancel_" or not field_key:
+                return 0
+
+            if field_key == "title":
+                new_t = prompt_inline_text("Task Title", current_value=draft.get("title") or "", allow_clear=False)
+                if new_t is not None:
+                    draft["title"] = new_t
+                    _recompute_task_draft_id_and_branch(draft, mode)
+
+            elif field_key == "status":
+                allowed_statuses = VALID_TASK_STATUSES if mode == "edit" else VALID_TASK_STATUSES[:4]
+                st_opts = [
+                    {
+                        "value": st,
+                        "label": f"{TASK_STATUS_ICONS.get(st, '•')} {st.upper()}",
+                    }
+                    for st in allowed_statuses
+                ]
+                chosen_st = prompt_fzf_dropdown(
+                    fzf_bin,
+                    st_opts,
+                    prompt="Task Status > ",
+                    header="Select task lifecycle status (triggers modular automations e.g. Jira transition on save):",
+                    current_value=draft.get("status") or "in_progress",
+                    allow_custom=False,
+                )
+                if chosen_st:
+                    draft["status"] = chosen_st
+
+            elif field_key == "jira_ticket":
+                chosen_jk, cand_patch = prompt_integration_candidate(
+                    fzf_bin,
+                    "ticket",
+                    paths,
+                    cfg,
+                    prompt="Jira Ticket > ",
+                    header="[Enter] Select Assigned Ticket, Open Jira in Browser, or Type Key (e.g. PROJ-123)  |  [Ctrl-O] Open Jira",
+                    current_value=draft.get("jira_ticket") or "",
+                    task=existing_task,
+                    repos=draft.get("repos"),
+                    allow_clear=True,
+                )
+                if chosen_jk is not None:
+                    if chosen_jk == "":
+                        draft["jira_ticket"] = ""
+                        draft["jira_ticket_display"] = ""
+                        _recompute_task_draft_id_and_branch(draft, mode)
+                    else:
+                        temp_res: dict[str, Any] = {"ref": chosen_jk}
+                        enr_msgs = apply_resource_target_to_draft(
+                            temp_res,
+                            chosen_jk,
+                            cfg,
+                            paths,
+                            task=existing_task,
+                            candidate_patch=cand_patch,
+                        )
+                        draft["jira_ticket"] = temp_res.get("ref") or chosen_jk
+                        draft["jira_ticket_display"] = temp_res.get("label") or draft["jira_ticket"]
+                        draft.setdefault("enrichment_messages", []).extend(enr_msgs)
+
+                        meta = temp_res.get("metadata") or {}
+                        j_title = meta.get("jira_title") or ""
+                        if not j_title and temp_res.get("label") and ":" in temp_res["label"]:
+                            j_title = temp_res["label"].split(":", 1)[1].strip()
+                        if j_title and (not draft.get("title") or draft.get("title") == "Untitled Task"):
+                            draft["title"] = f"{draft['jira_ticket']} {j_title}"
+                        if temp_res.get("summary") and not draft.get("brief"):
+                            draft["brief"] = temp_res["summary"]
+                        _recompute_task_draft_id_and_branch(draft, mode)
+
+            elif field_key == "pr_links":
+                chosen_pr, cand_patch = prompt_integration_candidate(
+                    fzf_bin,
+                    "pull_request",
+                    paths,
+                    cfg,
+                    prompt="GitHub PR or Resource Link > ",
+                    header="[Enter] Select Open PR (`gh pr list`), Open GitHub in Browser, or Type URL/repo#123  |  [Ctrl-O] Browser",
+                    current_value="",
+                    task=existing_task,
+                    repos=draft.get("repos"),
+                    allow_clear=True,
+                )
+                if chosen_pr is not None:
+                    if chosen_pr == "":
+                        draft["pr_links"] = []
+                    else:
+                        temp_res = {"ref": chosen_pr}
+                        enr_msgs = apply_resource_target_to_draft(
+                            temp_res,
+                            chosen_pr,
+                            cfg,
+                            paths,
+                            task=existing_task,
+                            candidate_patch=cand_patch,
+                        )
+                        link_val = temp_res.get("url") or temp_res.get("ref") or chosen_pr
+                        if link_val not in draft["pr_links"]:
+                            draft["pr_links"].append(link_val)
+                        draft.setdefault("enrichment_messages", []).extend(enr_msgs)
+
+                        meta = temp_res.get("metadata") or {}
+                        pr_repo = meta.get("repo")
+                        pr_branch = meta.get("branch")
+                        if pr_repo:
+                            try:
+                                r_short, _ = resolve_repo_path(pr_repo, cfg)
+                                if r_short not in draft["repos"]:
+                                    draft["repos"].append(r_short)
+                                if pr_branch:
+                                    draft["repo_branches"][r_short] = pr_branch
+                                    if not draft.get("custom_branch"):
+                                        draft["default_branch"] = pr_branch
+                            except Exception:
+                                pass
+                        if meta.get("pr_title") and (not draft.get("title") or draft.get("title") == "Untitled Task"):
+                            draft["title"] = meta["pr_title"]
+                        if meta.get("jira_key") and not draft.get("jira_ticket"):
+                            draft["jira_ticket"] = meta["jira_key"]
+                            draft["jira_ticket_display"] = meta["jira_key"]
+                        _recompute_task_draft_id_and_branch(draft, mode)
+
+            elif field_key == "repos":
+                avail_repos = discover_available_repos(cfg)
+                if avail_repos and sys.stdin.isatty():
+                    cur_repos = set(draft.get("repos") or [])
+                    repo_lines = [
+                        f"{r}\t📦 {r}" + ("  ✨ (currently selected)" if r in cur_repos else "")
+                        for r in avail_repos
+                    ]
+                    fzf_repo = subprocess.run(
+                        [
+                            fzf_bin,
+                            "-m",
+                            "--delimiter=\t",
+                            "--with-nth=2",
+                            "--prompt=Select Repositories ([Tab] multi-select) > ",
+                            "--header=[Tab] Toggle repo selection   [Enter] Confirm selection   [Esc] Cancel",
+                        ],
+                        input="\n".join(repo_lines),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if fzf_repo.returncode == 0 and fzf_repo.stdout.strip():
+                        chosen_repos = [
+                            ln.split("\t", 1)[0].strip()
+                            for ln in fzf_repo.stdout.strip().splitlines()
+                            if ln.strip()
+                        ]
+                        if mode == "edit":
+                            # Keep existing attached repos and append any newly selected ones
+                            merged = list(draft.get("repos") or [])
+                            for cr in chosen_repos:
+                                if cr not in merged:
+                                    merged.append(cr)
+                            draft["repos"] = merged
+                        else:
+                            draft["repos"] = chosen_repos
+                        for r_name in draft["repos"]:
+                            draft["repo_branches"].setdefault(
+                                r_name,
+                                draft.get("default_branch") or f"feat/{draft.get('id') or 'task'}",
+                            )
+                else:
+                    raw_r = prompt_inline_text(
+                        "Repositories (comma-separated)",
+                        current_value=",".join(draft.get("repos") or []),
+                        allow_clear=True,
+                    )
+                    if raw_r is not None:
+                        draft["repos"] = [r.strip() for r in raw_r.split(",") if r.strip()]
+
+            elif field_key == "default_branch":
+                br_opts = query_integration_field_options(
+                    "task.branch",
+                    paths,
+                    cfg,
+                    task=existing_task,
+                    repos=draft.get("repos"),
+                    task_id=draft.get("id"),
+                    current_branch=draft.get("default_branch"),
+                )
+                chosen_br = prompt_fzf_dropdown(
+                    fzf_bin,
+                    br_opts,
+                    prompt="Default Git Branch > ",
+                    header="Select a local/remote branch or type a new branch name ([Enter] Confirm, [Esc] Cancel):",
+                    current_value=draft.get("default_branch") or "",
+                    allow_custom=True,
+                )
+                if chosen_br:
+                    old_def = draft.get("default_branch")
+                    draft["default_branch"] = chosen_br
+                    draft["custom_branch"] = True
+                    for r_name in draft.get("repos") or []:
+                        if draft["repo_branches"].get(r_name) in (None, "", old_def):
+                            draft["repo_branches"][r_name] = chosen_br
+
+            elif field_key.startswith("repo_branch:"):
+                target_repo = field_key.split(":", 1)[1]
+                cur_rb = (draft.get("repo_branches") or {}).get(target_repo) or draft.get("default_branch") or ""
+                br_opts = query_integration_field_options(
+                    "worktree.branch",
+                    paths,
+                    cfg,
+                    task=existing_task,
+                    repo=target_repo,
+                    task_id=draft.get("id"),
+                    current_branch=cur_rb,
+                )
+                chosen_rb = prompt_fzf_dropdown(
+                    fzf_bin,
+                    br_opts,
+                    prompt=f"Git Branch [{target_repo}] > ",
+                    header=f"Select local/remote branch for '{target_repo}' or type a new branch name:",
+                    current_value=cur_rb,
+                    allow_custom=True,
+                )
+                if chosen_rb:
+                    draft.setdefault("repo_branches", {})[target_repo] = chosen_rb
+
+            elif field_key == "brief":
+                new_b = prompt_inline_text("Technical Brief", current_value=draft.get("brief") or "", allow_clear=True)
+                if new_b is not None:
+                    draft["brief"] = new_b
+
+            elif field_key == "id" and mode == "create":
+                new_id = prompt_inline_text("Task ID Slug", current_value=draft.get("id") or "", allow_clear=True)
+                if new_id is not None:
+                    if new_id == "":
+                        draft["custom_id"] = False
+                        _recompute_task_draft_id_and_branch(draft, mode)
+                    else:
+                        draft["id"] = slugify(new_id, 48)
+                        draft["custom_id"] = True
+
+
+def _submit_interactive_task_form(
+    draft: dict[str, Any],
+    original: dict[str, Any],
+    mode: str,
+    task_id: str | None,
+    paths: TaskPaths,
+    cfg: dict[str, Any],
+    no_herdr: bool = False,
+) -> int:
+    if mode == "create":
+        links: list[str] = []
+        if draft.get("jira_ticket"):
+            links.append(draft["jira_ticket"])
+        for pl in draft.get("pr_links") or []:
+            if pl and pl not in links:
+                links.append(pl)
+
+        title = (draft.get("title") or "").strip() or "Untitled Task"
+        repos_list = list(draft.get("repos") or [])
+        repo_branches = draft.get("repo_branches") or {}
+        def_branch = (draft.get("default_branch") or "").strip() or None
+
+        rc = cmd_create(
+            argparse.Namespace(
+                id=draft.get("id") or None,
+                title=title,
+                brief=draft.get("brief") or None,
+                task_status=draft.get("status") or "in_progress",
+                repos=",".join(repos_list) if repos_list else None,
+                repo_list=None,
+                branch=def_branch,
+                link=links or None,
+                label=None,
+                status=None,
+                summary=None,
+                spec_stdin=False,
+                focus=True,
+                no_herdr=no_herdr,
+                json=False,
+                interactive=False,
+            ),
+            paths,
+            cfg,
+        )
+        if rc != 0:
+            return rc
+
+        # If per-repo branch overrides differ from default_branch, apply them
+        created_id = resolve_current_task_id(paths, draft.get("id"))
+        if created_id and repo_branches:
+            rb_Pairs = [
+                f"{r}:{b}"
+                for r, b in repo_branches.items()
+                if b and b != def_branch
+            ]
+            if rb_Pairs:
+                cmd_update(
+                    argparse.Namespace(
+                        task_id=created_id,
+                        task=created_id,
+                        title=None,
+                        brief=None,
+                        status=None,
+                        branch=None,
+                        repo_branch=rb_Pairs,
+                        sync_pr_branches=False,
+                        force=False,
+                        no_herdr=no_herdr,
+                        json=False,
+                        interactive=False,
+                    ),
+                    paths,
+                    cfg,
+                )
+        return 0
+
+    # Edit mode
+    assert task_id is not None
+    orig_repos = set(original.get("repos") or [])
+    new_repos = [r for r in (draft.get("repos") or []) if r not in orig_repos]
+    for nr in new_repos:
+        target_b = (draft.get("repo_branches") or {}).get(nr) or draft.get("default_branch") or None
+        cmd_worktree_add(
+            argparse.Namespace(
+                task=task_id,
+                repo=nr,
+                branch=target_b,
+                label=None,
+                focus=False,
+                no_herdr=no_herdr,
+                json=False,
+            ),
+            paths,
+            cfg,
+        )
+
+    # Link any newly added Jira ticket or PR links
+    if draft.get("jira_ticket") and draft.get("jira_ticket") != original.get("jira_ticket"):
+        cmd_link(
+            argparse.Namespace(
+                target=draft["jira_ticket"],
+                task=task_id,
+                label=None,
+                status=None,
+                summary=None,
+                category="ticket",
+                provider="jira",
+                added_by=None,
+                metadata=None,
+                sync_branch=False,
+                no_herdr=no_herdr,
+                json=False,
+                interactive=False,
+            ),
+            paths,
+            cfg,
+        )
+
+    orig_prs = set(original.get("pr_links") or [])
+    for pl in draft.get("pr_links") or []:
+        if pl and pl not in orig_prs:
+            cmd_link(
+                argparse.Namespace(
+                    target=pl,
+                    task=task_id,
+                    label=None,
+                    status=None,
+                    summary=None,
+                    category=None,
+                    provider=None,
+                    added_by=None,
+                    metadata=None,
+                    sync_branch=False,
+                    no_herdr=no_herdr,
+                    json=False,
+                    interactive=False,
+                ),
+                paths,
+                cfg,
+            )
+
+    orig_rb = original.get("repo_branches") or {}
+    cur_rb = draft.get("repo_branches") or {}
+    rb_updates = [
+        f"{r}:{b}"
+        for r, b in cur_rb.items()
+        if b and b != orig_rb.get(r)
+    ]
+
+    new_title = draft.get("title") if draft.get("title") != original.get("title") else None
+    new_brief: str | None = None
+    if draft.get("brief") != original.get("brief"):
+        new_brief = "-" if not draft.get("brief") else draft["brief"]
+    new_status = draft.get("status") if draft.get("status") != original.get("status") else None
+    new_def_branch = draft.get("default_branch") if draft.get("default_branch") != original.get("default_branch") else None
+
+    return cmd_update(
+        argparse.Namespace(
+            task_id=task_id,
+            task=task_id,
+            title=new_title,
+            brief=new_brief,
+            status=new_status,
+            branch=new_def_branch,
+            repo_branch=rb_updates,
+            sync_pr_branches=False,
+            force=False,
+            no_herdr=no_herdr,
+            json=False,
+            interactive=False,
+        ),
+        paths,
+        cfg,
+    )
+
+
 def manage_task_resources(tid: str, paths: TaskPaths, cfg: dict[str, Any]) -> int:
     if not is_valid_task_id(tid):
         return 1
@@ -2557,7 +4400,7 @@ def manage_task_resources(tid: str, paths: TaskPaths, cfg: dict[str, Any]) -> in
         lines = format_fzf_resource_lines(task)
         header = (
             f"Task: {task.get('title', tid)}  |  "
-            "[Enter] Open URL   [Ctrl-P] Task Pilot   [Ctrl-N] +Add   [Ctrl-E] Edit   [Ctrl-D] Delete   [Esc] Back"
+            "[Enter] Open URL  [Ctrl-S] Status  [Ctrl-R] Sync  [Ctrl-P] Pilot  [Ctrl-N] +Add  [Ctrl-E] Edit  [Ctrl-D] Del  [Esc] Back"
         )
         fzf_cmd = [
             fzf_bin,
@@ -2568,6 +4411,8 @@ def manage_task_resources(tid: str, paths: TaskPaths, cfg: dict[str, Any]) -> in
             "--prompt", f"Resources ({tid}) > ",
             "--preview", f"{self_bin} _popup-action preview-resource {q_tid} {{1}}",
             "--preview-window", "down:64%:wrap",
+            "--bind", f"ctrl-s:execute({self_bin} _popup-action set-status {q_tid})+reload({self_bin} _popup-action list-resources {q_tid})",
+            "--bind", f"ctrl-r:execute({self_bin} _popup-action sync-task {q_tid})+reload({self_bin} _popup-action list-resources {q_tid})",
             "--bind", f"ctrl-p:execute({self_bin} _popup-action task-pilot {q_tid})+reload({self_bin} _popup-action list-resources {q_tid})",
             "--bind", f"ctrl-n:execute({self_bin} _popup-action add-resource {q_tid})+reload({self_bin} _popup-action list-resources {q_tid})",
             "--bind", f"ctrl-a:execute({self_bin} _popup-action add-resource {q_tid})+reload({self_bin} _popup-action list-resources {q_tid})",
@@ -2633,63 +4478,35 @@ def cmd_popup_action(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, 
                 return 1
         return 1
 
+    if action == "preview-form":
+        state_file = Path(tid)
+        if state_file.exists():
+            try:
+                st_data = json.loads(state_file.read_text(encoding="utf-8"))
+                print(format_form_preview(st_data, res_id or "", color=True))
+                return 0
+            except Exception as e:
+                print(f"Error previewing form: {e}")
+                return 1
+        return 1
+
+    if action == "preview-candidate":
+        pfile = Path(tid)
+        if pfile.exists():
+            try:
+                pdata = json.loads(pfile.read_text(encoding="utf-8"))
+                print(pdata.get(res_id or "", "No preview available."))
+                return 0
+            except Exception:
+                pass
+        return 1
+
     if action == "edit-resource":
         if res_id == "_pilot_":
             return cmd_popup_action(argparse.Namespace(action="task-pilot", task_id=tid, resource_id=None), paths, cfg)
         if res_id == "_add_" or not res_id:
             return cmd_popup_action(argparse.Namespace(action="add-resource", task_id=tid, resource_id=None), paths, cfg)
-        task = load_task(paths, tid)
-        if not task:
-            return 1
-        target_res = next(
-            (r for r in task.get("resources", []) if r.get("id") == res_id or r.get("ref") == res_id),
-            None,
-        )
-        if not target_res:
-            print(f"Resource '{res_id}' not found.")
-            return 1
-
-        print(f"\n--- ✏️ Edit Resource [{target_res.get('ref')}] in Task '{tid}' ---")
-        print("Press Enter to keep current value, or type '-' to clear an optional field.\n")
-
-        print(f"Display Label [{target_res.get('label') or ''}]: ", end="", flush=True)
-        new_label = sys.stdin.readline().strip()
-
-        print(f"Status Badge [{target_res.get('status') or 'none'}]: ", end="", flush=True)
-        new_status = sys.stdin.readline().strip()
-
-        print(f"Summary [{target_res.get('summary') or 'none'}]: ", end="", flush=True)
-        new_summary = sys.stdin.readline().strip()
-
-        print(f"URL [{target_res.get('url') or 'none'}]: ", end="", flush=True)
-        new_url = sys.stdin.readline().strip()
-
-        print(f"Reference Key [{target_res.get('ref') or ''}]: ", end="", flush=True)
-        new_ref = sys.stdin.readline().strip()
-
-        with task_store_lock(paths):
-            task_fresh = load_task(paths, tid)
-            if not task_fresh:
-                return 1
-            for r in task_fresh.get("resources", []):
-                if r.get("id") == target_res.get("id"):
-                    if new_label:
-                        r["label"] = "" if new_label == "-" else new_label
-                    if new_status:
-                        r["status"] = None if new_status == "-" else new_status
-                    if new_summary:
-                        r["summary"] = None if new_summary == "-" else new_summary
-                    if new_url:
-                        r["url"] = "" if new_url == "-" else new_url
-                    if new_ref and new_ref != "-":
-                        r["ref"] = new_ref
-                    r["updated_at"] = now_iso()
-                    break
-            task_fresh["updated_at"] = now_iso()
-            atomic_write_json(paths.task_file(tid), task_fresh)
-
-        HerdrClient(cfg).sync_sidebar_metadata(task_fresh)
-        return 0
+        return interactive_resource_form(tid, paths, cfg, resource_id=res_id)
 
     if action == "delete-resource":
         if res_id in ("_add_", "_pilot_") or not res_id:
@@ -2746,40 +4563,7 @@ def cmd_popup_action(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, 
         return 0
 
     if action == "add-resource":
-        print(f"\n--- 🔗 Link Resource to Task '{tid}' ---")
-        print("URL, Jira Ticket Key, or GitHub PR (e.g. PROJ-123, org/repo#45, or URL): ", end="", flush=True)
-        target = sys.stdin.readline().strip()
-        if not target:
-            return 0
-        print("Display Label (optional, e.g. 'PR #412' or 'Billing Ticket'): ", end="", flush=True)
-        label = sys.stdin.readline().strip() or None
-        print("Status Badge (optional, e.g. 'IN PROGRESS', 'REVIEW', 'OPEN'): ", end="", flush=True)
-        status = sys.stdin.readline().strip() or None
-        print("Short Summary (optional, avoids redundant MCP lookups): ", end="", flush=True)
-        summary = sys.stdin.readline().strip() or None
-
-        rc = cmd_link(
-            argparse.Namespace(
-                target=target,
-                task=tid,
-                label=label,
-                status=status,
-                summary=summary,
-                category=None,
-                provider=None,
-                added_by=None,
-                metadata=None,
-                sync_branch=False,
-                no_herdr=False,
-                json=False,
-            ),
-            paths,
-            cfg,
-        )
-        if rc != 0:
-            print("\nError linking resource. Press Enter to continue...")
-            sys.stdin.readline()
-        return 0
+        return interactive_resource_form(tid, paths, cfg, resource_id=None)
 
     if action == "set-status":
         task = load_task(paths, tid)
@@ -2849,70 +4633,7 @@ def cmd_popup_action(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, 
             return 0
 
         if choice == "quick":
-            print("\n--- ⚡ Quick Task Creator (0 AIC / 0 Tokens) ---")
-            print("Title (e.g. RabbitMQ Consumer Migration): ", end="", flush=True)
-            q_title = sys.stdin.readline().strip() or "Untitled Task"
-
-            avail_repos = discover_available_repos(cfg)
-            selected_repos: list[str] = []
-            if avail_repos and sys.stdin.isatty():
-                fzf_repo = subprocess.run(
-                    [
-                        fzf_bin, "-m",
-                        "--prompt=Select Repositories (Tab to multi-select) > ",
-                        "--header=[Tab] Toggle selection   [Enter] Confirm selection",
-                    ],
-                    input="\n".join(avail_repos),
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if fzf_repo.returncode == 0 and fzf_repo.stdout.strip():
-                    selected_repos = [r.strip() for r in fzf_repo.stdout.strip().splitlines() if r.strip()]
-
-            if selected_repos:
-                print(f"Repositories: {', '.join(selected_repos)}")
-                q_repos = ",".join(selected_repos)
-            else:
-                prompt_hint = f" (available: {', '.join(avail_repos[:6])}...)" if avail_repos else ""
-                print(f"Repositories (comma-separated{prompt_hint}): ", end="", flush=True)
-                q_repos = sys.stdin.readline().strip()
-
-            print("Git Branch (leave blank for feat/<task-id>): ", end="", flush=True)
-            q_branch = sys.stdin.readline().strip() or None
-
-            print("Link Jira Ticket or PR (optional URL or PROJ-123): ", end="", flush=True)
-            q_link = sys.stdin.readline().strip()
-
-            print("Short Brief (optional): ", end="", flush=True)
-            q_brief = sys.stdin.readline().strip() or None
-
-            print("\nProvisioning task workspace and worktrees...")
-            rc = cmd_create(
-                argparse.Namespace(
-                    id=None,
-                    title=q_title,
-                    brief=q_brief,
-                    task_status="in_progress",
-                    repos=q_repos or None,
-                    repo_list=None,
-                    branch=q_branch,
-                    link=[q_link] if q_link else None,
-                    label=None,
-                    status=None,
-                    summary=None,
-                    spec_stdin=False,
-                    focus=True,
-                    no_herdr=False,
-                    json=False,
-                ),
-                paths,
-                cfg,
-            )
-            if rc != 0:
-                print("\nError creating task. Press Enter to continue...")
-                sys.stdin.readline()
-            return 0
+            return interactive_task_form(paths, cfg, task_id=None)
 
         pilot_env = os.environ.copy()
         pilot_env.pop("HERDR_TASK_ID", None)
@@ -2962,51 +4683,7 @@ def cmd_popup_action(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, 
         return 0
 
     if action == "edit-task":
-        task = load_task(paths, tid)
-        if not task:
-            print(f"Task '{tid}' not found.")
-            return 1
-
-        print(f"\n--- ✏️ Edit Task Metadata, Status & Worktree Branches ['{tid}'] ---")
-        print("Press Enter to keep current value, or type '-' to clear brief.\n")
-
-        cur_title = task.get("title") or ""
-        print(f"Task Title [{cur_title}]: ", end="", flush=True)
-        new_title = sys.stdin.readline().strip()
-
-        cur_status = task.get("status") or "in_progress"
-        print(f"Task Status ({'/'.join(VALID_TASK_STATUSES[:4])}) [{cur_status}]: ", end="", flush=True)
-        new_status = sys.stdin.readline().strip()
-
-        cur_brief = task.get("brief") or ""
-        print(f"Task Brief [{cur_brief or 'none'}]: ", end="", flush=True)
-        new_brief = sys.stdin.readline().strip()
-
-        repo_branches: list[str] = []
-        for wt in task.get("worktrees", []):
-            r_name = wt.get("repo", "")
-            cur_b = wt.get("branch", "")
-            print(f"Git Branch for {r_name} [{cur_b}]: ", end="", flush=True)
-            nb = sys.stdin.readline().strip()
-            if nb and nb != cur_b:
-                repo_branches.append(f"{r_name}:{nb}")
-
-        return cmd_update(
-            argparse.Namespace(
-                task_id=tid,
-                task=tid,
-                title=new_title if new_title else None,
-                brief=new_brief if new_brief else None,
-                status=new_status if new_status else None,
-                branch=None,
-                repo_branch=repo_branches,
-                sync_pr_branches=False,
-                no_herdr=False,
-                json=False,
-            ),
-            paths,
-            cfg,
-        )
+        return interactive_task_form(paths, cfg, task_id=tid)
 
     return 0
 
@@ -3053,21 +4730,24 @@ def cmd_popup(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) -
         ]
 
         res = subprocess.run(fzf_cmd, input="\n".join(lines), text=True, capture_output=True, check=False)
-        if res.returncode != 0 or not res.stdout.strip():
+        if not res.stdout:
             return 0
 
         out_lines = res.stdout.splitlines()
-        key = out_lines[0].strip() if len(out_lines) >= 2 else ""
-        selected_line = out_lines[1] if len(out_lines) >= 2 else out_lines[0]
-        chosen_tid = selected_line.split("\t", 1)[0].strip()
-
+        key = out_lines[0].strip() if out_lines else ""
         if key == "ctrl-n":
-            return cmd_popup_action(
+            cmd_popup_action(
                 argparse.Namespace(action="pilot", task_id="_none_", resource_id=None),
                 paths,
                 cfg,
             )
+            continue
 
+        if res.returncode != 0 or len(out_lines) < 2:
+            return 0
+
+        selected_line = out_lines[1]
+        chosen_tid = selected_line.split("\t", 1)[0].strip()
         if not chosen_tid:
             return 0
 
@@ -3087,10 +4767,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     # create
     p_create = sub.add_parser("create", help="Create a multi-repo task and provision Herdr workspace/tabs")
+    p_create.add_argument("-i", "--interactive", action="store_true", help="Launch interactive field-navigator task form")
     p_create.add_argument("--id", help="Explicit task ID slug (e.g. PLA-4350-rabbitmq)")
     p_create.add_argument("--title", help="Human-readable task title")
     p_create.add_argument("--brief", help="Concise technical brief")
-    p_create.add_argument("--task-status", dest="task_status", choices=VALID_TASK_STATUSES, default="in_progress", help="Initial task lifecycle status")
+    p_create.add_argument("--task-status", dest="task_status", choices=VALID_TASK_STATUSES, default=None, help="Initial task lifecycle status")
     p_create.add_argument("--repos", help="Comma-separated list of repository names or paths")
     p_create.add_argument("--repo", dest="repo_list", action="append", help="Repository name or path (repeatable)")
     p_create.add_argument("--branch", help="Git branch name across repositories")
@@ -3106,6 +4787,7 @@ def build_parser() -> argparse.ArgumentParser:
     # update / edit
     for name in ("update", "edit"):
         p_upd = sub.add_parser(name, help="Update task title, status, brief, default branch, or switch worktree branches")
+        p_upd.add_argument("-i", "--interactive", action="store_true", help="Launch interactive field-navigator task form")
         p_upd.add_argument("task_id", nargs="?", help="Task ID (defaults to ambient task)")
         p_upd.add_argument("--task", help="Task ID (alternative flag)")
         p_upd.add_argument("--title", help="Update human-readable task title (also renames Herdr workspace)")
@@ -3124,6 +4806,7 @@ def build_parser() -> argparse.ArgumentParser:
             action="store_true",
             help="Automatically switch each attached repo worktree to match its linked GitHub PR branch",
         )
+        p_upd.add_argument("--force", action="store_true", help="Force branch switch even if worktree has uncommitted changes")
         p_upd.add_argument("--no-herdr", action="store_true")
         p_upd.add_argument("--json", action="store_true")
 
@@ -3138,6 +4821,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_auto = sub.add_parser("automations", help="Inspect modular lifecycle automations")
     p_auto.add_argument("auto_action", nargs="?", default="list", choices=["list"], help="Automation subcommand")
     p_auto.add_argument("--json", action="store_true")
+
+    # integrations
+    p_integ = sub.add_parser("integrations", help="Inspect modular integrations, candidates, and options")
+    p_integ.add_argument("integ_action", nargs="?", default="list", choices=["list", "candidates", "options"])
+    p_integ.add_argument("target", nargs="?", help="Candidate kind (ticket, pull_request, resource) or field (resource.status, task.branch)")
+    p_integ.add_argument("--task", help="Task ID")
+    p_integ.add_argument("--category", help="Resource category")
+    p_integ.add_argument("--provider", help="Resource provider")
+    p_integ.add_argument("--repo", help="Repository name")
+    p_integ.add_argument("--ref", help="Resource reference/key")
+    p_integ.add_argument("--json", action="store_true")
 
     # current
     p_curr = sub.add_parser("current", help="Resolve active task ID from HERDR_TASK_ID, HERDR_WORKSPACE_ID, or PWD")
@@ -3165,7 +4859,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # link
     p_link = sub.add_parser("link", help="Link or update a resource (Jira, PR, Slack, Alert, Doc) on a task")
-    p_link.add_argument("target", help="URL, Jira key (PROJ-123), or GitHub shorthand (repo#123)")
+    p_link.add_argument("-i", "--interactive", action="store_true", help="Launch interactive field-navigator resource form")
+    p_link.add_argument("target", nargs="?", default=None, help="URL, Jira key (PROJ-123), or GitHub shorthand (repo#123)")
     p_link.add_argument("--label", help="Short display label")
     p_link.add_argument("--status", help="Cached status badge (e.g. 'In Progress', 'OPEN')")
     p_link.add_argument("--summary", help="Distilled technical summary (avoids redundant MCP calls)")
@@ -3256,6 +4951,8 @@ def build_parser() -> argparse.ArgumentParser:
             "resources",
             "list-resources",
             "preview-resource",
+            "preview-form",
+            "preview-candidate",
             "open-resource",
             "edit-resource",
             "delete-resource",
@@ -3275,13 +4972,20 @@ def main(argv: list[str] | None = None) -> int:
 
     cmd = args.subcommand
     if cmd == "create":
+        if getattr(args, "interactive", False):
+            return interactive_task_form(paths, cfg, task_id=None, initial_args=args, no_herdr=getattr(args, "no_herdr", False))
         return cmd_create(args, paths, cfg)
     if cmd in ("update", "edit"):
+        if getattr(args, "interactive", False):
+            tid = resolve_current_task_id(paths, getattr(args, "task_id", None) or getattr(args, "task", None))
+            return interactive_task_form(paths, cfg, task_id=tid, initial_args=args, no_herdr=getattr(args, "no_herdr", False))
         return cmd_update(args, paths, cfg)
     if cmd == "sync":
         return cmd_sync(args, paths, cfg)
     if cmd == "automations":
         return cmd_automations(args, paths, cfg)
+    if cmd == "integrations":
+        return cmd_integrations(args, paths, cfg)
     if cmd == "current":
         return cmd_current(args, paths, cfg)
     if cmd == "list":
@@ -3291,6 +4995,12 @@ def main(argv: list[str] | None = None) -> int:
     if cmd in ("focus", "switch"):
         return cmd_focus(args, paths, cfg)
     if cmd == "link":
+        if getattr(args, "interactive", False) or not getattr(args, "target", None):
+            tid = resolve_current_task_id(paths, getattr(args, "task", None))
+            if not tid:
+                print("Error: could not resolve active task. Pass --task <id>.", file=sys.stderr)
+                return 1
+            return interactive_resource_form(tid, paths, cfg, initial_target=getattr(args, "target", None), no_herdr=getattr(args, "no_herdr", False))
         return cmd_link(args, paths, cfg)
     if cmd == "unlink":
         return cmd_unlink(args, paths, cfg)

@@ -7,4 +7,4 @@ platforms = ["linux", "macos"]
 
 [[startup]]
 id = "sync_task_sidebar"
-command = ["./bin/herdr-task", "sync-sidebar"]
+command = ["/Users/utilisateur/.local/bin/herdr-task", "sync-sidebar"]

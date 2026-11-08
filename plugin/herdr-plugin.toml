@@ -1,0 +1,10 @@
+id = "herdr-task-pilot"
+name = "Herdr Task Pilot"
+version = "0.1.0"
+description = "Lightweight multi-repo task, git worktree, and Cockpit orchestrator for Herdr"
+min_herdr_version = "0.7.5"
+platforms = ["linux", "macos"]
+
+[[startup]]
+id = "sync_task_sidebar"
+command = ["/Users/utilisateur/.local/bin/herdr-task", "sync-sidebar"]

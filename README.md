@@ -13,6 +13,62 @@ Lightweight multi-repository task, git worktree, 4-pane Cockpit, and modular lif
   * `git` (`lazygit`)
 * **Centralized Resource Hub**: Attach Jira tickets, GitHub PRs/Issues (with zero-AI-token `gh pr view` auto-enrichment), Slack threads, Grafana/Datadog/Sentry alerts, and Notion/Confluence/Figma docs to a task, plus cross-repo handoff notes.
 * **Modular Lifecycle Automations (`automations/*.py`)**: Event-driven drop-in modules triggered on `task.created`, `task.status_changed`, `resource.linked`, `task.sync`, and `task.cleanup`.
+* **Modular Integrations & Interactive Form Navigator (`integrations/*.py`)**: Dropdown pickers and candidate providers for Jira tickets (live search + browser redirect), GitHub PRs (`gh pr list` + browser redirect), repositories, Git branches, and provider-specific status badges.
+
+---
+
+## Interactive Field-Navigator Forms & Modular Integrations
+
+When creating or editing tasks and resources (via `herdr-task popup` or CLI `-i / --interactive`), `herdr-task` presents an interactive **Field-Navigator Form**:
+
+1. **All fields visible at once** in a navigable list with live ANSI preview of the full card and unsaved changes.
+2. Select any field with `Up/Down` (or fuzzy filter) and press `Enter` to edit **just that field**, returning immediately to the form.
+3. **Dropdowns & Pickers for Fixed & Dynamic Values**:
+   - **Task Status**: `📋 TODO`, `🚧 IN_PROGRESS`, `👀 IN_REVIEW`, `✅ DONE`, `📦 ARCHIVED`.
+   - **Repositories**: `fzf -m` multi-select from configured `repo_roots`.
+   - **Git Branches**: Local & remote branches (`git for-each-ref`) for the repository, plus linked PR branches or custom input.
+   - **Jira Tickets**: Queries Jira Cloud REST API v3 for your assigned open issues (`assignee = currentUser()`), includes `🌐 Open Jira in Browser` shortcuts, and caches recent tickets offline.
+   - **GitHub PRs**: Queries live open PRs via `gh pr list`, includes `🌐 Open GitHub PRs in Browser`, and caches recent PRs.
+   - **Status Badges**: Populated dynamically by modular integrations (live Jira workflow transitions, GitHub PR states `OPEN`/`DRAFT`/`APPROVED`/`MERGED`, Alert states `FIRING`/`RESOLVED`, Doc states `DRAFT`/`APPROVED`).
+4. **Pre-filled Inline Text Editing**: Free-text fields (`Title`, `Brief`, `Label`, `Summary`, `URL`, `Task ID`) pre-fill their current value into `readline` so you can edit in-place with arrow keys and Backspace.
+5. **Keyboard Shortcuts**:
+   - `[Ctrl-S]` / `✅ Save`: Save and apply all changes.
+   - `[Ctrl-O]`: Open relevant Jira ticket, GitHub PR, or URL in default browser without leaving the form.
+   - `[Esc]` / `❌ Cancel`: Discard changes and return.
+
+### Writing a Custom Integration Module
+
+Drop any `.py` file into `~/.config/herdr/tasks/integrations/my_provider.py` (or implement hooks inside an existing automation in `automations/`):
+
+```python
+INTEGRATION_ID = "my_provider"
+DESCRIPTION = "Custom candidate and status badge provider"
+DEFAULT_SETTINGS = {"enabled": True}
+
+def provide_candidates(kind: str, context: dict, settings: dict) -> list[dict]:
+    # Return selectable items for Jira/PR/resource pickers
+    return [
+        {
+            "value": "PROJ-999",
+            "label": "🎫 PROJ-999 — Critical bug",
+            "category": "ticket",
+            "provider": "jira",
+            "preview": "Detailed ticket preview...",
+        },
+        {
+            "value": "__open_url__:https://internal.portal/dashboard",
+            "action": "open_url",
+            "url": "https://internal.portal/dashboard",
+            "label": "🌐 Open Internal Dashboard in Browser",
+        },
+    ]
+
+def provide_field_options(field: str, context: dict, settings: dict) -> list[dict]:
+    # Return dropdown options for fields like "resource.status", "task.branch"
+    if field == "resource.status":
+        return [{"value": "TRIAGED", "label": "👀 TRIAGED — Reviewed by lead"}]
+    return []
+```
 
 ---
 
@@ -129,11 +185,25 @@ herdr-task create \
 # Transition task status (triggers Jira transition via jira_status_sync)
 herdr-task update --status in_review
 
+# Launch interactive task creation form with Jira & GitHub pickers
+herdr-task create -i
+
+# Edit an existing task interactively (field navigator with branch & status dropdowns)
+herdr-task edit -i
+
+# Link or edit a resource interactively
+herdr-task link -i
+
 # Bidirectionally sync Jira ticket & GitHub PR statuses
 herdr-task sync
 
 # List discovered lifecycle automation modules
 herdr-task automations list
+
+# Inspect modular integration providers and query candidates / dropdown options
+herdr-task integrations list
+herdr-task integrations candidates ticket
+herdr-task integrations options resource.status --category pull_request
 
 # Open interactive Mission Control popup (fzf)
 # Keys: [Enter] Resources | [Ctrl-S] Status | [Ctrl-R] Sync | [Ctrl-P] Pilot | [Ctrl-E] Edit | [Ctrl-X] Cleanup

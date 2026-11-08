@@ -1,5 +1,13 @@
+# Local user tasks & active state
+*.json
+.lock
+archive/
+workspaces/
+
+# Python & OS artifacts
 __pycache__/
 *.py[cod]
 *$py.class
 .DS_Store
 .pytest_cache/
+*.swp
