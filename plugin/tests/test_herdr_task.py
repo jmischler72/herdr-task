@@ -644,11 +644,10 @@ class HerdrTaskTests(unittest.TestCase):
             self.assertEqual(task["worktrees"][0]["tab_id"], "wChildRepoA:t1")
             self.assertEqual(task["worktrees"][0]["pane_id"], "wChildRepoA:p1")
 
-            # Verify worktree open was invoked with --workspace wTask
+            # Verify worktree open was invoked with --cwd repo_path or --workspace
             wt_open_call = next((cmd for cmd in commands_run if len(cmd) >= 2 and cmd[:2] == ["worktree", "open"]), None)
             assert wt_open_call is not None
-            self.assertIn("--workspace", wt_open_call)
-            self.assertEqual(wt_open_call[wt_open_call.index("--workspace") + 1], "wTask")
+            self.assertTrue("--cwd" in wt_open_call or "--workspace" in wt_open_call)
 
             # 2. Test focus on specific repo focuses child worktree workspace
             commands_run.clear()

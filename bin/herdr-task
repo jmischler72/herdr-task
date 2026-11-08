@@ -1232,15 +1232,35 @@ def ensure_git_worktree(
 class HerdrClient:
     def __init__(self, cfg: dict[str, Any]) -> None:
         self.herdr_bin = resolve_bin("herdr", cfg, "herdr_bin")
+        self.session = os.environ.get("HERDR_SESSION") or cfg.get("herdr_session")
+        if not self.session:
+            default_sock = Path(os.path.expanduser("~/.config/herdr/herdr.sock"))
+            sessions_dir = Path(os.path.expanduser("~/.config/herdr/sessions"))
+            if not default_sock.exists() and sessions_dir.is_dir():
+                for s_dir in sessions_dir.iterdir():
+                    if s_dir.is_dir() and (s_dir / "herdr.sock").exists():
+                        self.session = s_dir.name
+                        break
 
     def run(self, args: list[str], timeout: float = 15.0) -> tuple[int, dict[str, Any] | None, str]:
+        cmd = [self.herdr_bin]
+        if self.session and "--session" not in args:
+            cmd.extend(["--session", self.session])
+        cmd.extend(args)
+        env = dict(os.environ)
+        if self.session:
+            env["HERDR_SESSION"] = self.session
+            s_sock = os.path.expanduser(f"~/.config/herdr/sessions/{self.session}/herdr.sock")
+            if os.path.exists(s_sock):
+                env["HERDR_SOCKET"] = s_sock
         try:
             res = subprocess.run(
-                [self.herdr_bin, *args],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
                 check=False,
+                env=env,
             )
         except Exception as e:
             return 1, None, str(e)
@@ -1310,17 +1330,19 @@ class HerdrClient:
 
     def open_worktree_workspace(
         self,
-        workspace_id: str,
-        worktree_path: str,
+        repo_path: str | None = None,
+        workspace_id: str | None = None,
+        worktree_path: str | None = None,
         branch: str | None = None,
         label: str | None = None,
         focus: bool = False,
         trust_repository: bool = True,
     ) -> dict[str, Any] | None:
-        cmd = [
-            "worktree", "open",
-            "--workspace", workspace_id,
-        ]
+        cmd = ["worktree", "open"]
+        if repo_path:
+            cmd.extend(["--cwd", repo_path])
+        elif workspace_id:
+            cmd.extend(["--workspace", workspace_id])
         if worktree_path:
             cmd.extend(["--path", worktree_path])
         elif branch:
@@ -1488,9 +1510,10 @@ def provision_herdr_workspace_for_task(
     task_id = task["id"]
     wts = task.get("worktrees", [])
     ws_label = compute_workspace_label(task)
-    initial_cwd = wts[0]["worktree_path"] if wts else os.path.expanduser("~")
+    # The primary task workspace acts as the Task Hub
+    hub_cwd = os.path.expanduser("~")
 
-    ws_res = herdr.create_workspace(initial_cwd, ws_label, task_id, focus=focus)
+    ws_res = herdr.create_workspace(hub_cwd, ws_label, task_id, focus=focus)
     if not ws_res:
         return False
 
@@ -1503,10 +1526,11 @@ def provision_herdr_workspace_for_task(
     if first_tab_id:
         herdr.rename_tab(first_tab_id, "hub")
 
-    # Open each repo as a linked worktree workspace nested under the primary task workspace
+    # Open each repo as a linked worktree workspace nested under its repo parent
     for idx, wt in enumerate(wts):
         wt_label = wt.get("tab_title") or wt["repo"]
         child_res = herdr.open_worktree_workspace(
+            repo_path=wt.get("repo_path"),
             workspace_id=ws_id,
             worktree_path=wt["worktree_path"],
             branch=wt.get("branch"),
@@ -2093,6 +2117,7 @@ def cmd_focus(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) -
             if (not wt_ws or wt_ws not in live_ws_ids) and Path(wt["worktree_path"]).exists():
                 wt_label = wt.get("tab_title") or wt["repo"]
                 child_res = herdr.open_worktree_workspace(
+                    repo_path=wt.get("repo_path"),
                     workspace_id=ws_id,
                     worktree_path=wt["worktree_path"],
                     branch=wt.get("branch"),
@@ -2204,6 +2229,7 @@ def cmd_worktree_add(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, 
             existing_ws = existing_same.get("workspace_id")
             if not existing_ws or existing_ws not in live_ws_ids:
                 child_res = herdr.open_worktree_workspace(
+                    repo_path=existing_same.get("repo_path"),
                     workspace_id=ws_id,
                     worktree_path=existing_same["worktree_path"],
                     branch=existing_same.get("branch"),
@@ -2258,6 +2284,7 @@ def cmd_worktree_add(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, 
     if not getattr(args, "no_herdr", False) and ws_id:
         herdr = HerdrClient(cfg)
         child_res = herdr.open_worktree_workspace(
+            repo_path=new_wt.get("repo_path"),
             workspace_id=ws_id,
             worktree_path=new_wt["worktree_path"],
             branch=new_wt.get("branch"),
