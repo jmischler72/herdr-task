@@ -228,6 +228,7 @@ class HerdrTaskTests(unittest.TestCase):
         task = ht.load_task(self.paths, "PROJ-1-test")
         assert task is not None
         task["workspace_id"] = "wTest"
+        task["worktrees"][0]["workspace_id"] = "wChild"
         task["worktrees"][0]["tab_id"] = "wTest:t1"
         task["worktrees"][0]["pane_id"] = "wTest:p1"
         task["worktrees"][0]["cockpit_panes"] = {"editor": "wTest:p1"}
@@ -240,6 +241,7 @@ class HerdrTaskTests(unittest.TestCase):
         assert archived is not None
         self.assertEqual(archived["status"], "archived")
         self.assertIsNone(archived["workspace_id"])
+        self.assertIsNone(archived["worktrees"][0].get("workspace_id"))
         self.assertIsNone(archived["worktrees"][0]["tab_id"])
         self.assertIsNone(archived["worktrees"][0]["pane_id"])
         self.assertNotIn("cockpit_panes", archived["worktrees"][0])
@@ -607,6 +609,58 @@ class HerdrTaskTests(unittest.TestCase):
             self.assertEqual(edited["status"], "in_review")
             self.assertEqual(edited["brief"], "Updated brief")
             self.assertEqual(edited["worktrees"][0]["branch"], "feat/rmq-v2")
+
+    def test_linked_worktree_workspace_provisioning_and_focus(self) -> None:
+        commands_run: list[list[str]] = []
+
+        def fake_run(self_herdr: Any, args: list[str], timeout: float = 15.0) -> tuple[int, dict[str, Any], str]:
+            commands_run.append(list(args))
+            if len(args) >= 2 and args[0] == "workspace" and args[1] == "create":
+                return 0, {"result": {"workspace": {"workspace_id": "wTask"}, "tab": {"tab_id": "wTask:tHub"}, "root_pane": {"pane_id": "wTask:pHub"}}}, ""
+            if len(args) >= 2 and args[0] == "worktree" and args[1] == "open":
+                return 0, {"result": {"workspace": {"workspace_id": "wChildRepoA"}, "tab": {"tab_id": "wChildRepoA:t1"}, "root_pane": {"pane_id": "wChildRepoA:p1"}}}, ""
+            if len(args) >= 2 and args[0] == "workspace" and args[1] == "list":
+                return 0, {"result": {"workspaces": [{"workspace_id": "wTask"}, {"workspace_id": "wChildRepoA"}]}}, ""
+            if len(args) >= 2 and args[0] == "tab" and args[1] == "list":
+                return 0, {"result": {"tabs": [{"tab_id": "wTask:tHub"}]}}, ""
+            if len(args) >= 2 and args[0] == "workspace" and args[1] in ("focus", "close", "rename", "report-metadata"):
+                return 0, {"result": {}}, ""
+            return 0, {"result": {}}, ""
+
+        with patch.object(ht.HerdrClient, "run", new=fake_run):
+            # 1. Create task with Herdr workspace provisioning
+            rc = ht.main([
+                "create",
+                "--id", "PROJ-WT-test",
+                "--title", "Worktree Test",
+                "--repos", "repo-a",
+            ])
+            self.assertEqual(rc, 0)
+            task = ht.load_task(self.paths, "PROJ-WT-test")
+            assert task is not None
+            self.assertEqual(task["workspace_id"], "wTask")
+            self.assertEqual(len(task["worktrees"]), 1)
+            self.assertEqual(task["worktrees"][0]["workspace_id"], "wChildRepoA")
+            self.assertEqual(task["worktrees"][0]["tab_id"], "wChildRepoA:t1")
+            self.assertEqual(task["worktrees"][0]["pane_id"], "wChildRepoA:p1")
+
+            # Verify worktree open was invoked with --workspace wTask
+            wt_open_call = next((cmd for cmd in commands_run if len(cmd) >= 2 and cmd[:2] == ["worktree", "open"]), None)
+            assert wt_open_call is not None
+            self.assertIn("--workspace", wt_open_call)
+            self.assertEqual(wt_open_call[wt_open_call.index("--workspace") + 1], "wTask")
+
+            # 2. Test focus on specific repo focuses child worktree workspace
+            commands_run.clear()
+            rc_foc = ht.main(["focus", "PROJ-WT-test", "--repo", "repo-a"])
+            self.assertEqual(rc_foc, 0)
+            self.assertIn(["workspace", "focus", "wChildRepoA"], commands_run)
+
+            # 3. Test cleanup invokes close --group
+            commands_run.clear()
+            rc_cl = ht.main(["cleanup", "PROJ-WT-test", "--force"])
+            self.assertEqual(rc_cl, 0)
+            self.assertIn(["workspace", "close", "wTask", "--group"], commands_run)
 
 
 if __name__ == "__main__":

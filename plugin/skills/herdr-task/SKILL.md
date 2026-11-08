@@ -5,7 +5,7 @@ description: Centralize multi-repository tasks, git worktrees, Jira tickets, Git
 
 # `herdr-task` Skill (`/Users/utilisateur/.local/bin/herdr-task`)
 
-1 Herdr Workspace = 1 Task (`HERDR_TASK_ID` is set inside task tabs). 1 Tab = 1 Repo Worktree (4-pane cockpit: `nvim`, `copilot`, `term`, `lazygit`).
+1 Task = Primary Task Workspace (`HERDR_TASK_ID`). Repos = Clickable Linked Worktree Workspaces (`is_linked_worktree: true`) nested under the task in Herdr's sidebar, with unlimited tabs per repository worktree. Initial tab has 4-pane Cockpit layout (`code`, `agent`, `term`, `git`).
 
 ## Role 1: Pilot Agent (Creating / Tracking a New Task)
 When asked to create or track a task (or when `HERDR_PILOT_MODE=new_task` / `HERDR_TASK_ID` is unset):

@@ -4,13 +4,9 @@ Lightweight multi-repository task, git worktree, 4-pane Cockpit, and modular lif
 
 ## Core Mental Model
 
-* **1 Herdr Workspace = 1 Task** (`HERDR_TASK_ID` is automatically injected into every workspace tab).
-* **1 Tab = 1 Repository Git Worktree** provisioned at `~/.herdr/worktrees/<task-id>/<repo>`.
-* **4-Pane Cockpit Layout per Repo Tab**:
-  * `code` (`nvim .`)
-  * `agent` (`copilot` / `claude`)
-  * `term` (shell)
-  * `git` (`lazygit`)
+* **1 Task = Primary Task Workspace (`HERDR_TASK_ID`)**: Acts as the mission control hub for cross-repo task overview, resources, notes, and lifecycle automations.
+* **Repositories = Clickable Linked Worktree Workspaces (`is_linked_worktree: true`)**: Repositories appear directly in Herdr's sidebar nested under the task, allowing **unlimited tabs per repository worktree**.
+* **4-Pane Cockpit Layout per Repo Worktree**: Initial tab comes with `code` (`nvim .`), `agent` (`copilot`), `term` (shell), and `git` (`lazygit`).
 * **Centralized Resource Hub**: Attach Jira tickets, GitHub PRs/Issues (with zero-AI-token `gh pr view` auto-enrichment), Slack threads, Grafana/Datadog/Sentry alerts, and Notion/Confluence/Figma docs to a task, plus cross-repo handoff notes.
 * **Modular Lifecycle Automations (`automations/*.py`)**: Event-driven drop-in modules triggered on `task.created`, `task.status_changed`, `resource.linked`, `task.sync`, and `task.cleanup`.
 * **Modular Integrations & Interactive Form Navigator (`integrations/*.py`)**: Dropdown pickers and candidate providers for Jira tickets (live search + browser redirect), GitHub PRs (`gh pr list` + browser redirect), repositories, Git branches, and provider-specific status badges.
