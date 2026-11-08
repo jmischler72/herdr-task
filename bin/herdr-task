@@ -1320,9 +1320,10 @@ class HerdrClient:
         cmd = [
             "worktree", "open",
             "--workspace", workspace_id,
-            "--path", worktree_path,
         ]
-        if branch:
+        if worktree_path:
+            cmd.extend(["--path", worktree_path])
+        elif branch:
             cmd.extend(["--branch", branch])
         if label:
             cmd.extend(["--label", label])
@@ -1726,13 +1727,16 @@ def cmd_create(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) 
     )
 
     if not getattr(args, "no_herdr", False):
-        herdr = HerdrClient(cfg)
-        provision_herdr_workspace_for_task(
-            herdr,
-            task,
-            focus=bool(getattr(args, "focus", False)),
-            cfg=cfg,
-        )
+        try:
+            herdr = HerdrClient(cfg)
+            provision_herdr_workspace_for_task(
+                herdr,
+                task,
+                focus=bool(getattr(args, "focus", False)),
+                cfg=cfg,
+            )
+        except Exception as e:
+            print(f"Warning: could not provision Herdr workspace for task '{task_id}': {e}", file=sys.stderr)
 
     with task_store_lock(paths):
         task["updated_at"] = now_iso()
@@ -3924,7 +3928,10 @@ def _recompute_task_draft_id_and_branch(draft: dict[str, Any], mode: str) -> Non
             draft["id"] = ""
 
     if not draft.get("custom_branch"):
-        comp_id = draft.get("id") or "new-task"
+        comp_id = draft.get("id")
+        if not comp_id:
+            rand_suffix = uuid.uuid4().hex[:4]
+            comp_id = f"task-{rand_suffix}"
         draft["default_branch"] = f"feat/{comp_id}" if jk else comp_id
 
 
@@ -4104,7 +4111,17 @@ def interactive_task_form(
                 continue
 
             if expect_key == "ctrl-s" or field_key == "_save_":
-                return _submit_interactive_task_form(draft, original, mode, task_id, paths, cfg, no_herdr=no_herdr)
+                try:
+                    rc = _submit_interactive_task_form(draft, original, mode, task_id, paths, cfg, no_herdr=no_herdr)
+                    if rc == 0:
+                        return 0
+                except Exception as e:
+                    prompt_inline_text(
+                        f"⚠️ Error saving task: {e}\nPress Enter to return to form",
+                        current_value="",
+                        allow_clear=True,
+                    )
+                continue
 
             if field_key == "_cancel_" or not field_key:
                 return 0
@@ -4367,29 +4384,43 @@ def _submit_interactive_task_form(
         repo_branches = draft.get("repo_branches") or {}
         def_branch = (draft.get("default_branch") or "").strip() or None
 
-        rc = cmd_create(
-            argparse.Namespace(
-                id=draft.get("id") or None,
-                title=title,
-                brief=draft.get("brief") or None,
-                task_status=draft.get("status") or "in_progress",
-                repos=",".join(repos_list) if repos_list else None,
-                repo_list=None,
-                branch=def_branch,
-                link=links or None,
-                label=None,
-                status=None,
-                summary=None,
-                spec_stdin=False,
-                focus=True,
-                no_herdr=no_herdr,
-                json=False,
-                interactive=False,
-            ),
-            paths,
-            cfg,
-        )
+        try:
+            rc = cmd_create(
+                argparse.Namespace(
+                    id=draft.get("id") or None,
+                    title=title,
+                    brief=draft.get("brief") or None,
+                    task_status=draft.get("status") or "in_progress",
+                    repos=",".join(repos_list) if repos_list else None,
+                    repo_list=None,
+                    branch=def_branch,
+                    link=links or None,
+                    label=None,
+                    status=None,
+                    summary=None,
+                    spec_stdin=False,
+                    focus=True,
+                    no_herdr=no_herdr,
+                    json=False,
+                    interactive=False,
+                ),
+                paths,
+                cfg,
+            )
+        except Exception as e:
+            prompt_inline_text(
+                f"⚠️ Error creating task: {e}\nPress Enter to return to form",
+                current_value="",
+                allow_clear=True,
+            )
+            return 1
+
         if rc != 0:
+            prompt_inline_text(
+                "⚠️ Task creation failed (check error messages above).\nPress Enter to return to form",
+                current_value="",
+                allow_clear=True,
+            )
             return rc
 
         # If per-repo branch overrides differ from default_branch, apply them
