@@ -669,9 +669,6 @@ def resolve_current_task_id(
         for t in tasks:
             if t.get("workspace_id") == env_ws_id:
                 return t["id"]
-            for wt in t.get("worktrees", []):
-                if wt.get("workspace_id") == env_ws_id:
-                    return t["id"]
 
     try:
         cwd = os.path.realpath(os.getcwd())
@@ -1510,59 +1507,50 @@ def provision_herdr_workspace_for_task(
     task_id = task["id"]
     wts = task.get("worktrees", [])
     ws_label = compute_workspace_label(task)
-    # The primary task workspace acts as the Task Hub
-    hub_cwd = os.path.expanduser("~")
+    initial_cwd = wts[0]["worktree_path"] if wts else os.path.expanduser("~")
 
-    ws_res = herdr.create_workspace(hub_cwd, ws_label, task_id, focus=focus)
+    ws_res = herdr.create_workspace(initial_cwd, ws_label, task_id, focus=focus)
     if not ws_res:
         return False
 
     ws_id = (ws_res.get("workspace") or {}).get("workspace_id")
     first_tab_id = (ws_res.get("tab") or {}).get("tab_id")
+    first_pane_id = (
+        (ws_res.get("root_pane") or {}).get("pane_id")
+        or (ws_res.get("pane") or {}).get("pane_id")
+    )
     if not ws_id:
         return False
 
     task["workspace_id"] = ws_id
-    if first_tab_id:
-        herdr.rename_tab(first_tab_id, "hub")
 
-    # Open each repo as a linked worktree workspace nested under its repo parent
-    for idx, wt in enumerate(wts):
+    if not wts:
+        if first_tab_id:
+            herdr.rename_tab(first_tab_id, "scratch")
+        herdr.sync_sidebar_metadata(task)
+        return True
+
+    # Reuse the workspace's initial tab directly for the first repository
+    if first_tab_id and first_pane_id:
+        herdr.rename_tab(first_tab_id, wts[0].get("tab_title") or wts[0]["repo"])
+        wts[0]["tab_id"] = first_tab_id
+        _provision_tab_cockpit(herdr, wts[0], first_pane_id, cfg)
+        remaining_wts = wts[1:]
+    else:
+        remaining_wts = wts
+
+    for idx, wt in enumerate(remaining_wts):
         wt_label = wt.get("tab_title") or wt["repo"]
-        child_res = herdr.open_worktree_workspace(
-            repo_path=wt.get("repo_path"),
-            workspace_id=ws_id,
-            worktree_path=wt["worktree_path"],
-            branch=wt.get("branch"),
-            label=wt_label,
-            focus=(focus and idx == 0),
-            trust_repository=True,
+        t_res = herdr.create_tab(
+            ws_id,
+            wt["worktree_path"],
+            wt_label,
+            task_id,
+            focus=(focus and idx == 0 and not first_pane_id),
         )
-        if child_res:
-            child_ws_id = (child_res.get("workspace") or {}).get("workspace_id")
-            child_tab_id = (child_res.get("tab") or {}).get("tab_id")
-            child_pane_id = (
-                (child_res.get("root_pane") or {}).get("pane_id")
-                or (child_res.get("pane") or {}).get("pane_id")
-            )
-            wt["workspace_id"] = child_ws_id
-            wt["tab_id"] = child_tab_id
-            wt["pane_id"] = child_pane_id
-            if child_pane_id:
-                _provision_tab_cockpit(herdr, wt, child_pane_id, cfg)
-        else:
-            # Fallback to single-workspace tab if open_worktree_workspace is unsupported or unavailable
-            t_res = herdr.create_tab(
-                ws_id,
-                wt["worktree_path"],
-                wt_label,
-                task_id,
-                focus=(focus and idx == 0),
-            )
-            if t_res:
-                wt["workspace_id"] = None
-                wt["tab_id"] = (t_res.get("tab") or {}).get("tab_id")
-                _provision_tab_cockpit(herdr, wt, (t_res.get("root_pane") or {}).get("pane_id"), cfg)
+        if t_res:
+            wt["tab_id"] = (t_res.get("tab") or {}).get("tab_id")
+            _provision_tab_cockpit(herdr, wt, (t_res.get("root_pane") or {}).get("pane_id"), cfg)
 
     herdr.sync_sidebar_metadata(task)
     return True
@@ -2113,34 +2101,13 @@ def cmd_focus(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) -
         live_tab_ids = {t.get("tab_id") for t in herdr.list_tabs(ws_id)}
         updated = False
         for wt in task.get("worktrees", []):
-            wt_ws = wt.get("workspace_id")
-            if (not wt_ws or wt_ws not in live_ws_ids) and Path(wt["worktree_path"]).exists():
+            if (not wt.get("tab_id") or wt["tab_id"] not in live_tab_ids) and Path(wt["worktree_path"]).exists():
                 wt_label = wt.get("tab_title") or wt["repo"]
-                child_res = herdr.open_worktree_workspace(
-                    repo_path=wt.get("repo_path"),
-                    workspace_id=ws_id,
-                    worktree_path=wt["worktree_path"],
-                    branch=wt.get("branch"),
-                    label=wt_label,
-                    focus=False,
-                    trust_repository=True,
-                )
-                if child_res:
-                    wt["workspace_id"] = (child_res.get("workspace") or {}).get("workspace_id")
-                    wt["tab_id"] = (child_res.get("tab") or {}).get("tab_id")
-                    wt["pane_id"] = (
-                        (child_res.get("root_pane") or {}).get("pane_id")
-                        or (child_res.get("pane") or {}).get("pane_id")
-                    )
-                    if wt["pane_id"]:
-                        _provision_tab_cockpit(herdr, wt, wt["pane_id"], cfg)
+                t_res = herdr.create_tab(ws_id, wt["worktree_path"], wt_label, tid, focus=False)
+                if t_res:
+                    wt["tab_id"] = (t_res.get("tab") or {}).get("tab_id")
+                    _provision_tab_cockpit(herdr, wt, (t_res.get("root_pane") or {}).get("pane_id"), cfg)
                     updated = True
-                elif not wt.get("tab_id") or wt["tab_id"] not in live_tab_ids:
-                    t_res = herdr.create_tab(ws_id, wt["worktree_path"], wt_label, tid, focus=False)
-                    if t_res:
-                        wt["tab_id"] = (t_res.get("tab") or {}).get("tab_id")
-                        _provision_tab_cockpit(herdr, wt, (t_res.get("root_pane") or {}).get("pane_id"), cfg)
-                        updated = True
         if updated:
             with task_store_lock(paths):
                 fresh = load_task(paths, tid) or task
@@ -2153,15 +2120,10 @@ def cmd_focus(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any]) -
         if target_repo:
             focused = False
             for wt in task.get("worktrees", []):
-                if wt["repo"] == target_repo:
-                    if wt.get("workspace_id") and wt["workspace_id"] in live_ws_ids:
-                        herdr.focus_workspace(wt["workspace_id"])
-                        focused = True
-                        break
-                    elif wt.get("tab_id"):
-                        herdr.focus_tab(wt["tab_id"])
-                        focused = True
-                        break
+                if wt["repo"] == target_repo and wt.get("tab_id"):
+                    herdr.focus_tab(wt["tab_id"])
+                    focused = True
+                    break
             if not focused:
                 herdr.focus_workspace(ws_id)
         else:
@@ -2224,46 +2186,23 @@ def cmd_worktree_add(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, 
     if existing_same is not None:
         if not getattr(args, "no_herdr", False) and ws_id:
             herdr = HerdrClient(cfg)
-            live_ws_ids = {w.get("workspace_id") for w in herdr.list_workspaces()}
             live_tab_ids = {t.get("tab_id") for t in herdr.list_tabs(ws_id)}
-            existing_ws = existing_same.get("workspace_id")
-            if not existing_ws or existing_ws not in live_ws_ids:
-                child_res = herdr.open_worktree_workspace(
-                    repo_path=existing_same.get("repo_path"),
-                    workspace_id=ws_id,
-                    worktree_path=existing_same["worktree_path"],
-                    branch=existing_same.get("branch"),
-                    label=existing_same.get("tab_title") or repo_short,
+            if not existing_same.get("tab_id") or existing_same["tab_id"] not in live_tab_ids:
+                t_res = herdr.create_tab(
+                    ws_id,
+                    existing_same["worktree_path"],
+                    existing_same.get("tab_title") or repo_short,
+                    tid,
                     focus=bool(getattr(args, "focus", False)),
-                    trust_repository=True,
                 )
-                if child_res:
-                    existing_same["workspace_id"] = (child_res.get("workspace") or {}).get("workspace_id")
-                    existing_same["tab_id"] = (child_res.get("tab") or {}).get("tab_id")
-                    existing_same["pane_id"] = (
-                        (child_res.get("root_pane") or {}).get("pane_id")
-                        or (child_res.get("pane") or {}).get("pane_id")
-                    )
-                    if existing_same["pane_id"]:
-                        _provision_tab_cockpit(herdr, existing_same, existing_same["pane_id"], cfg)
-                elif not existing_same.get("tab_id") or existing_same["tab_id"] not in live_tab_ids:
-                    t_res = herdr.create_tab(
-                        ws_id,
-                        existing_same["worktree_path"],
-                        existing_same.get("tab_title") or repo_short,
-                        tid,
-                        focus=bool(getattr(args, "focus", False)),
-                    )
-                    if t_res:
-                        existing_same["tab_id"] = (t_res.get("tab") or {}).get("tab_id")
-                        _provision_tab_cockpit(herdr, existing_same, (t_res.get("root_pane") or {}).get("pane_id"), cfg)
-
+                if t_res:
+                    existing_same["tab_id"] = (t_res.get("tab") or {}).get("tab_id")
+                    _provision_tab_cockpit(herdr, existing_same, (t_res.get("root_pane") or {}).get("pane_id"), cfg)
                 with task_store_lock(paths):
                     fresh = load_task(paths, tid)
                     if fresh:
                         for w in fresh.get("worktrees", []):
                             if w.get("worktree_path") == existing_same["worktree_path"]:
-                                w["workspace_id"] = existing_same.get("workspace_id")
                                 w["tab_id"] = existing_same.get("tab_id")
                                 w["pane_id"] = existing_same.get("pane_id")
                                 if "cockpit_panes" in existing_same:
@@ -2271,9 +2210,7 @@ def cmd_worktree_add(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, 
                         fresh["updated_at"] = now_iso()
                         atomic_write_json(paths.task_file(tid), fresh)
             elif getattr(args, "focus", False):
-                if existing_ws and existing_ws in live_ws_ids:
-                    herdr.focus_workspace(existing_ws)
-                elif existing_same.get("tab_id"):
+                if existing_same.get("tab_id"):
                     herdr.focus_tab(existing_same["tab_id"])
         if getattr(args, "json", False):
             print(json.dumps(existing_same, indent=2))
@@ -2283,46 +2220,29 @@ def cmd_worktree_add(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, 
 
     if not getattr(args, "no_herdr", False) and ws_id:
         herdr = HerdrClient(cfg)
-        child_res = herdr.open_worktree_workspace(
-            repo_path=new_wt.get("repo_path"),
-            workspace_id=ws_id,
-            worktree_path=new_wt["worktree_path"],
-            branch=new_wt.get("branch"),
-            label=tab_title,
+        t_res = herdr.create_tab(
+            ws_id,
+            new_wt["worktree_path"],
+            tab_title,
+            tid,
             focus=bool(getattr(args, "focus", False)),
-            trust_repository=True,
         )
-        if child_res:
-            new_wt["workspace_id"] = (child_res.get("workspace") or {}).get("workspace_id")
-            new_wt["tab_id"] = (child_res.get("tab") or {}).get("tab_id")
-            new_wt["pane_id"] = (
-                (child_res.get("root_pane") or {}).get("pane_id")
-                or (child_res.get("pane") or {}).get("pane_id")
-            )
-            if new_wt["pane_id"]:
-                _provision_tab_cockpit(herdr, new_wt, new_wt["pane_id"], cfg)
-        else:
-            t_res = herdr.create_tab(
-                ws_id,
-                new_wt["worktree_path"],
-                tab_title,
-                tid,
-                focus=bool(getattr(args, "focus", False)),
-            )
-            if t_res:
-                new_wt["tab_id"] = (t_res.get("tab") or {}).get("tab_id")
-                _provision_tab_cockpit(herdr, new_wt, (t_res.get("root_pane") or {}).get("pane_id"), cfg)
+        if t_res:
+            new_wt["tab_id"] = (t_res.get("tab") or {}).get("tab_id")
+            _provision_tab_cockpit(herdr, new_wt, (t_res.get("root_pane") or {}).get("pane_id"), cfg)
 
         with task_store_lock(paths):
             fresh = load_task(paths, tid)
             if fresh:
                 for w in fresh.get("worktrees", []):
                     if w.get("worktree_path") == new_wt["worktree_path"]:
-                        w["workspace_id"] = new_wt.get("workspace_id")
                         w["tab_id"] = new_wt.get("tab_id")
                         w["pane_id"] = new_wt.get("pane_id")
                         if "cockpit_panes" in new_wt:
                             w["cockpit_panes"] = new_wt["cockpit_panes"]
+                fresh["updated_at"] = now_iso()
+                atomic_write_json(paths.task_file(tid), fresh)
+                task = fresh
                 fresh["updated_at"] = now_iso()
                 atomic_write_json(paths.task_file(tid), fresh)
                 task = fresh
@@ -2924,11 +2844,7 @@ def cmd_cleanup(args: argparse.Namespace, paths: TaskPaths, cfg: dict[str, Any])
 
     ws_id = task.get("workspace_id")
     if ws_id and not getattr(args, "no_herdr", False):
-        client = HerdrClient(cfg)
-        client.close_workspace(ws_id, group=True)
-        for wt in task.get("worktrees", []):
-            if wt.get("workspace_id"):
-                client.close_workspace(wt["workspace_id"])
+        HerdrClient(cfg).close_workspace(ws_id)
 
     _remove_task_worktrees_on_disk(
         task,
