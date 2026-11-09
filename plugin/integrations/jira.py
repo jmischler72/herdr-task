@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-jira_status_sync — Modular lifecycle automation for herdr-task.
+jira — Unified modular integration for herdr-task.
 
 Synchronizes task status and ticket metadata bidirectionally between herdr-task
-and Jira Cloud via Jira REST API v3 (zero external dependencies, zero AI tokens).
+and Jira Cloud via Jira REST API v3 (zero external dependencies, zero AI tokens),
+and provides Jira ticket dropdown candidates & live status workflow options.
 
 Events handled:
   - resource.linked:      Enriches linked Jira ticket with real summary, status, and description.
@@ -26,8 +27,8 @@ import urllib.request
 from urllib.request import Request
 
 
-AUTOMATION_ID = "jira_status_sync"
 INTEGRATION_ID = "jira"
+AUTOMATION_ID = "jira_status_sync"
 DESCRIPTION = "Bidirectional Jira ticket status & metadata sync + ticket/status picker integration via Jira REST API v3"
 EVENTS = (
     "resource.linked",
@@ -307,10 +308,6 @@ def _transition_jira_issue(
     status_map: dict[str, list[str]],
     timeout: float = 5.0,
 ) -> tuple[bool, str | None, str]:
-    """
-    Transitions `issue_key` to a Jira workflow state matching `target_task_status`.
-    Returns `(changed, new_jira_status_name, message)`.
-    """
     candidates = [c.strip().lower() for c in status_map.get(target_task_status, []) if c.strip()]
     if not candidates:
         return False, None, f"No Jira status mapping configured for '{target_task_status}'"
@@ -331,7 +328,6 @@ def _transition_jira_issue(
         return False, None, f"No workflow transitions available for {issue_key}"
 
     chosen: dict[str, Any] | None = None
-    # 1. Exact case-insensitive match against target status name (`to.name`) or transition `name`
     for cand in candidates:
         for tr in transitions:
             to_name = ((tr.get("to") or {}).get("name") or "").strip().lower()
@@ -342,7 +338,6 @@ def _transition_jira_issue(
         if chosen:
             break
 
-    # 2. Substring match fallback
     if not chosen:
         for cand in candidates:
             for tr in transitions:
@@ -453,10 +448,6 @@ def provide_candidates(
     context: dict[str, Any],
     settings: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """
-    Modular integration hook returning selectable Jira tickets and browser redirect actions
-    for interactive task/resource forms.
-    """
     if kind not in ("ticket", "jira", "resource"):
         return []
 
@@ -474,7 +465,6 @@ def provide_candidates(
 
     candidates: list[dict[str, Any]] = []
 
-    # 1. Browser redirect options (so user can always jump to Jira to check/search tickets)
     if browse_root:
         if current_ref and "-" in current_ref and not current_ref.startswith("http"):
             candidates.append({
@@ -524,7 +514,6 @@ def provide_candidates(
             ),
         })
 
-    # 2. Live Jira tickets assigned to currentUser() via Jira REST API v3
     seen_keys: set[str] = set()
     auth_header = _resolve_auth_header(settings)
     timeout = float(settings.get("timeout_sec") or 5.0)
@@ -577,7 +566,6 @@ def provide_candidates(
                 },
             })
 
-    # 3. Cached Jira tickets from active/archived local tasks (works offline or without API token)
     task_sources = ([task] if task else []) + list(all_tasks)
     for t_obj in task_sources:
         if not isinstance(t_obj, dict):
@@ -624,10 +612,6 @@ def provide_field_options(
     context: dict[str, Any],
     settings: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """
-    Modular integration hook returning predefined values for form dropdowns
-    (e.g., Jira workflow statuses for `resource.status`).
-    """
     if field != "resource.status":
         return []
 
@@ -646,7 +630,6 @@ def provide_field_options(
     options: list[dict[str, Any]] = []
     seen_upper: set[str] = set()
 
-    # 1. If we have a specific Jira issue key and credentials, query live available workflow transitions
     if base_url and auth_header and issue_key and "-" in issue_key and not issue_key.startswith("http"):
         safe_key = quote(issue_key, safe="")
         code, data, _ = _jira_request(
@@ -667,7 +650,6 @@ def provide_field_options(
                         "provider": "jira",
                     })
 
-    # 2. Predefined statuses from `status_map` configuration
     status_map = settings.get("status_map") or DEFAULT_SETTINGS["status_map"]
     primary_labels = {
         "todo": "To Do / Backlog",
@@ -683,7 +665,6 @@ def provide_field_options(
             if not clean or clean in seen_upper:
                 continue
             seen_upper.add(clean)
-            # Keep the dropdown concise: include the primary status name for each category plus common ones
             if idx < 2:
                 options.append({
                     "value": clean,
@@ -699,9 +680,6 @@ def enrich_resource(
     context: dict[str, Any],
     settings: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """
-    On-the-fly enrichment hook called by interactive forms when a Jira ticket is entered.
-    """
     if res.get("category") != "ticket" and res.get("provider") != "jira":
         return None
     cfg = context.get("config") or {}
@@ -734,7 +712,7 @@ def handle_event(
             return {
                 "task_modified": False,
                 "messages": [
-                    "Jira sync skipped: configure JIRA_EMAIL and JIRA_API_TOKEN (or automations.jira_status_sync in config.json)"
+                    "Jira sync skipped: configure JIRA_EMAIL and JIRA_API_TOKEN (or integrations.jira in config.json)"
                 ],
             }
         return None

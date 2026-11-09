@@ -473,7 +473,7 @@ class HerdrTaskTests(unittest.TestCase):
         integs = ht.discover_integrations(self.paths, cfg)
         integ_ids = {i["id"] for i in integs}
         self.assertIn("jira", integ_ids)
-        self.assertIn("github_git", integ_ids)
+        self.assertIn("github", integ_ids)
 
         with patch("urllib.request.urlopen", side_effect=mock_jira.urlopen):
             # 2. Query ticket candidates (returns browser shortcuts + live Jira tickets)

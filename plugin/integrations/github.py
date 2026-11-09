@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-github_git — Modular integration for herdr-task interactive forms.
+github — Unified modular integration for herdr-task interactive forms & git workflows.
 
 Provides:
   - Candidate GitHub Pull Requests (`gh pr list` + cached task PRs + browser redirect links).
@@ -19,7 +19,8 @@ import subprocess
 from typing import Any
 
 
-INTEGRATION_ID = "github_git"
+INTEGRATION_ID = "github"
+AUTOMATION_ID = "github_git"
 DESCRIPTION = "GitHub PR picker, browser shortcuts, resource status presets, and Git repo/branch options"
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -340,7 +341,8 @@ def _list_git_branches_for_repo(repo_path: Path, limit: int = 40) -> list[tuple[
                 break
         return out
     except Exception:
-        return []
+        pass
+    return []
 
 
 def provide_field_options(
@@ -379,7 +381,6 @@ def provide_field_options(
         options: list[dict[str, Any]] = []
         seen_branches: set[str] = set()
 
-        # 1. Suggested feat/<task-id> or current default branch
         task_id = str(context.get("task_id") or task.get("id") or "").strip()
         cur_branch = str(context.get("current_branch") or task.get("default_branch") or "").strip()
         if cur_branch:
@@ -399,7 +400,6 @@ def provide_field_options(
                     "provider": "git",
                 })
 
-        # 2. Branches from linked GitHub PRs on the task
         for r in task.get("resources") or []:
             if isinstance(r, dict) and r.get("category") == "pull_request":
                 meta = r.get("metadata") or {}
@@ -413,7 +413,6 @@ def provide_field_options(
                         "provider": "github",
                     })
 
-        # 3. Local & remote git branches from the repository
         for r_name in repos_to_inspect[:3]:
             rp = _resolve_repo_path(r_name, cfg)
             if rp:
